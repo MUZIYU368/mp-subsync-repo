@@ -2,21 +2,27 @@
 SubSync —— 外挂字幕同步
 ===========================
 订阅 MoviePilot 的 TransferComplete 事件，在整理完成的那一刻，
-把下载目录里的外挂字幕按 strm「同名复制」到最终媒体库目录。
+把**下载目录**里的外挂字幕按 strm「同名复制」到最终媒体库目录。
 
 设计要点
 --------
-- 事件驱动：只处理本次整理涉及的源目录与目标目录，不做全盘扫描，
+- 事件驱动：只处理本次整理涉及的媒体库目标目录，不对媒体库做全盘扫描，
   比定时轮询快得多，也不会误伤无关文件。
+- 字幕来源是**配置里的下载目录**，不是媒体库的父目录。下载目录与媒体库
+  是两棵独立的目录树（如 /media/downloads/电视剧 与 /media/电视剧），
+  早期版本误把扫描根设成 target_diritem 的父级，导致永远匹配不到字幕。
+- 下载目录扫描带时间窗口，只处理近期落地的字幕，避免每次整理都全量遍历。
 - 匹配算法沿用 cron 版 sync_subs_to_strm.py 的 v3 策略：
   先按剧名/电影名建立候选，再匹配集号或年份；中文名用双向最长公共
   子串，英文名用整词命中；别名配置把英文资源名映射到中文库目录。
+- 强匹配才动手：没有明确证据就整条放弃，不做猜测。
 - 幂等：目标已存在且未开启覆盖时跳过，重复整理不会反复复制。
 """
 from __future__ import annotations
 
 import re
 import shutil
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -138,8 +144,13 @@ def sniff_chinese(path: Path, max_bytes: int = 4096) -> bool:
         return True
 
 
-def collect_subtitles(root: Path, chinese_only: bool = True) -> List[SubtitleFile]:
-    """递归收集指定目录下的字幕文件。"""
+def collect_subtitles(root: Path, chinese_only: bool = True,
+                      since: Optional[float] = None) -> List[SubtitleFile]:
+    """递归收集指定目录下的字幕文件。
+
+    since 给定时，只保留 mtime 不早于该时刻的文件。下载目录会不断堆积，
+    每次整理都全量遍历既慢又没必要——刚下载完的字幕 mtime 一定是新的。
+    """
     out: List[SubtitleFile] = []
     if not root.exists() or not root.is_dir():
         return out
@@ -150,6 +161,12 @@ def collect_subtitles(root: Path, chinese_only: bool = True) -> List[SubtitleFil
     for sub in children:
         if not sub.is_file() or sub.suffix.lower() not in SUB_EXTS:
             continue
+        if since is not None:
+            try:
+                if sub.stat().st_mtime < since:
+                    continue
+            except OSError:
+                continue
         lang, is_zh = parse_lang_tag(sub.stem)
         if chinese_only and not (is_zh or sniff_chinese(sub)):
             continue
@@ -432,16 +449,16 @@ def apply_plans(plans: List[Plan], overwrite: bool,
 
 
 class SubSync(_PluginBase):
-    """外挂字幕同步：整理完成后把同目录字幕按 strm 同名复制到媒体库。"""
+    """外挂字幕同步：整理完成后把下载目录的字幕按 strm 同名复制到媒体库。"""
 
     # 插件名称
     plugin_name = "外挂字幕同步"
     # 插件描述
-    plugin_desc = "订阅 TransferComplete 事件，整理完成立刻把外挂字幕按 strm 同名复制到最终媒体库目录。"
+    plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "MUZIYU368"
     # 插件标签
@@ -457,6 +474,7 @@ class SubSync(_PluginBase):
     _overwrite = False
     _delete_source = False
     _chinese_only = True
+    _recent_window = 86400.0
     _download_movie = ""
     _download_tv = ""
     _alias = ""
@@ -468,6 +486,7 @@ class SubSync(_PluginBase):
         self._overwrite = False
         self._delete_source = False
         self._chinese_only = True
+        self._recent_window = 86400.0
         self._download_movie = ""
         self._download_tv = ""
         self._alias = ""
@@ -478,6 +497,11 @@ class SubSync(_PluginBase):
         # 默认关闭源文件清理：删除不可逆，需用户显式开启
         self._delete_source = bool(config.get("delete_source", False))
         self._chinese_only = bool(config.get("chinese_only", True))
+        try:
+            days = float(config.get("recent_window_days", 1) or 1)
+        except (TypeError, ValueError):
+            days = 1.0
+        self._recent_window = max(days, 0.1) * 86400
         self._download_movie = str(config.get("download_movie") or "")
         self._download_tv = str(config.get("download_tv") or "")
         self._alias = str(config.get("alias") or "")
@@ -543,6 +567,14 @@ class SubSync(_PluginBase):
                         }
                     },
                     {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "recent_window_days",
+                            "label": "下载目录扫描时间窗口（天）",
+                            "placeholder": "1"
+                        }
+                    },
+                    {
                         "component": "VTextarea",
                         "props": {
                             "model": "alias",
@@ -564,9 +596,10 @@ class SubSync(_PluginBase):
                         "component": "VAlert",
                         "props": {
                             "type": "info",
-                            "text": "整理完成时只处理本次涉及的源目录与目标目录。"
-                                    "若源目录已被清理，插件会自动跳过，"
-                                    "此时可依赖 cron 版 sync_subs_to_strm.py 兜底。"
+                            "text": "字幕来源是你上面配置的下载目录，媒体库侧只按本次整理的目标目录"
+                                    "建立索引。下载目录与媒体库是两棵独立的目录树，"
+                                    "两者都必须填写正确，否则匹配不到。"
+                                    "扫描时间窗口用于跳过老字幕，只处理近期新增的。"
                         }
                     }
                 ]
@@ -578,6 +611,7 @@ class SubSync(_PluginBase):
             "delete_source": False,
             "download_movie": "/media/downloads/电影",
             "download_tv": "/media/downloads/电视剧",
+            "recent_window_days": 1,
             "alias": ""
         }
 
@@ -590,19 +624,24 @@ class SubSync(_PluginBase):
         return None
 
     def _source_dirs(self) -> List[Path]:
-        """返回配置中启用的下载目录列表。"""
+        """返回配置中有效（存在）的下载目录列表。"""
         dirs: List[Path] = []
         for raw in (self._download_movie, self._download_tv):
             p = Path(raw).strip() if raw else None
-            if p and p.exists() and p.is_dir():
-                dirs.append(p)
+            if not p:
+                continue
+            try:
+                if p.exists() and p.is_dir() and p not in dirs:
+                    dirs.append(p)
+            except OSError:
+                continue
         return dirs
 
-    def _allowed_source(self, path: Path) -> bool:
-        """判断字幕路径是否位于配置的下载目录内。"""
-        if not self._source_dirs():
+    def _allowed_source(self, path: Path, roots: List[Path]) -> bool:
+        """判断字幕路径是否位于给定目录内。roots 为空时不做限制。"""
+        if not roots:
             return True
-        for root in self._source_dirs():
+        for root in roots:
             try:
                 path.relative_to(root)
                 return True
@@ -612,7 +651,7 @@ class SubSync(_PluginBase):
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
-        """整理完成后，把同目录外挂字幕按 strm 同名复制到媒体库。"""
+        """整理完成后，把下载目录的外挂字幕按 strm 同名复制到媒体库。"""
         if not self._enabled:
             return
         data = event.event_data or {}
@@ -624,31 +663,66 @@ class SubSync(_PluginBase):
         if not target or not target.get("path"):
             return
         target_root = Path(target["path"])
-        if not target_root.exists():
+        try:
+            if not target_root.exists():
+                return
+        except OSError:
             return
 
-        strm_files = sorted(target_root.rglob("*.strm"))
+        # 媒体库侧：只用本次整理的目标目录建立索引，不做全盘扫描
+        try:
+            strm_files = sorted(target_root.rglob("*.strm"))
+        except OSError as exc:
+            logger.warning(f"[字幕同步] 扫描目标目录失败 {target_root}: {exc}")
+            return
         if not strm_files:
+            logger.debug(f"[字幕同步] {target_root} 下暂无 strm，本次跳过")
             return
 
-        subs = collect_subtitles(target_root.parent, self._chinese_only)
+        # 下载目录侧：字幕来源。这里必须是配置的下载目录，
+        # 不能用 target_root.parent —— 那是媒体库的分类父目录，与下载目录不相交。
+        source_dirs = self._source_dirs()
+        if not source_dirs:
+            logger.warning("[字幕同步] 未找到有效的下载目录，请在插件设置里检查路径")
+            return
+
+        since = time.time() - self._recent_window
+        subs: List[SubtitleFile] = []
+        for d in source_dirs:
+            subs.extend(collect_subtitles(d, self._chinese_only, since))
         if not subs:
+            logger.debug(
+                f"[字幕同步] 下载目录近 {self._recent_window / 86400:.1f} 天内没有新增字幕")
             return
 
         alias_map = load_alias_text(self._alias)
         movie_entries = build_movie_entries(strm_files)
         tv_entries = build_tv_entries(strm_files)
         if not movie_entries and not tv_entries:
+            logger.debug("[字幕同步] 目标目录里没有可识别的剧名 (年份) 结构，跳过")
             return
 
         plans: List[Plan] = []
+        missed = 0
         for sub in subs:
-            if not self._allowed_source(sub.path):
+            try:
+                if not self._allowed_source(sub.path, source_dirs):
+                    continue
+                plan = plan_for_subtitle(sub, movie_entries, tv_entries, alias_map)
+            except Exception as exc:  # 单条失败不能拖垮整批
+                missed += 1
+                logger.warning(f"[字幕同步] 处理字幕时出错 {sub.path}: {exc}")
                 continue
-            plan = plan_for_subtitle(sub, movie_entries, tv_entries, alias_map)
             if plan:
                 plans.append(plan)
+            else:
+                missed += 1
+                logger.debug(f"[字幕同步] 未匹配到目标，跳过: {sub.path.name}")
 
+        if missed:
+            logger.info(
+                f"[字幕同步] 共扫描 {len(subs)} 条字幕，{missed} 条未匹配"
+                f"（可调低时间窗口、放宽别名配置，或调高 MoviePilot 日志级别查看明细）")
         if not plans:
             return
 
