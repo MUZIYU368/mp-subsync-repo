@@ -458,7 +458,7 @@ class SubSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "MUZIYU368"
     # 插件标签
@@ -623,6 +623,22 @@ class SubSync(_PluginBase):
         """返回插件详情页面；本插件不提供独立页面。"""
         return None
 
+    def _dump_event(self, data: Dict[str, Any], transfer: Dict[str, Any]) -> None:
+        """把 TransferComplete 事件的真实结构打进日志，供开发确认字段名。"""
+        logger.info(f"[字幕同步][调试] event_data 顶层字段: {sorted(data.keys())}")
+        logger.info(f"[字幕同步][调试] transferinfo 完整内容: {transfer}")
+        for k, v in transfer.items():
+            if isinstance(v, dict):
+                logger.info(f"[字幕同步][调试]   {k} -> dict, 子字段: {sorted(v.keys())}")
+            elif isinstance(v, (list, tuple)):
+                if v and isinstance(v[0], dict):
+                    logger.info(
+                        f"[字幕同步][调试]   {k} -> list[dict], 首元素子字段: {sorted(v[0].keys())}")
+                else:
+                    logger.info(f"[字幕同步][调试]   {k} -> {v!r}")
+            else:
+                logger.info(f"[字幕同步][调试]   {k} = {v!r}")
+
     def _source_dirs(self) -> List[Path]:
         """返回配置中有效（存在）的下载目录列表。"""
         dirs: List[Path] = []
@@ -658,6 +674,11 @@ class SubSync(_PluginBase):
         transfer = data.get("transferinfo")
         if not transfer:
             return
+
+        # v1.2.0 临时调试输出：确认 transferinfo 的真实结构，
+        # 以便下一版直接复用 MP 整理时的改名结果，实现零猜测自动匹配。
+        # 拿到结构后本段会在 1.3.0 移除。
+        self._dump_event(data, transfer)
 
         target = transfer.get("target_diritem")
         if not target or not target.get("path"):
