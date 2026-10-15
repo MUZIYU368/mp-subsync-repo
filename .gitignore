@@ -1,0 +1,4 @@
+# 测试脚手架的临时目录
+tests/v3/subsync/.subsync_test_tmp/
+__pycache__/
+*.pyc
