@@ -11,13 +11,17 @@ SubSync —— 外挂字幕同步
   2) 定时全库补扫——兜底。事件时机不理想、字幕晚到、容器重建等情况都能补齐。
 - 落点永远是 strm 所在目录（strm.parent），不做分类推断，
   因此字幕与媒体文件必然同目录、同名主体，仅多一个语言标签。
-- 媒体库索引只认「剧名 (年份)」结构的目录，因此 115 中转目录
-  （平铺 strm，无该结构）会被自然跳过，不会把字幕错放到中间目录。
-- 强匹配才动手：没有明确证据（中文 2 字以上 / 英文整词 / 别名）就整条放弃。
+- 匹配优先问 MoviePilot 自己的转移历史：它已经知道这部片子整理后叫什么，
+  字幕按原始资源名查表即可落到最终位置，不用猜、也就不用填别名。
+  查不到才退回中文 LCS / 英文整词的启发式匹配。
+- 媒体库索引认两种目录写法（「剧名 (年份)」目录，或年份写在文件名里的剧名目录），
+  但一律拒绝 115 中转 / 暂存目录下的 strm，不会把字幕错放到中间目录。
+- 强匹配才动手：没有明确证据（转移历史 / 中文 2 字以上 / 英文整词 / 别名）就整条放弃。
 - 幂等：目标已存在且未开启覆盖时跳过，重复扫描不会反复复制。
 """
 from __future__ import annotations
 
+import importlib
 import re
 import shutil
 import time
@@ -66,7 +70,34 @@ CJK_RE = re.compile(r"[㐀-鿿豈-﫿]")
 RE_TV_EPISODE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 RE_YEAR = re.compile(r"[\.\s\(\[](19\d{2}|20\d{2})[\.\s\)\]]")
 RE_LIB_DIR = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)\s*$")
+# 目录名不带年份时，年份写在 strm 文件名里：复仇者联盟3：无限战争 (2018) - 2160p.strm
+RE_LIB_PREFIX = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)")
 RE_SEASON_DIR = re.compile(r"^(?:Season|S)\s*\d+", re.I)
+
+# 中转 / 暂存目录：这里的 strm 还没进最终媒体库，字幕不能落在这一层
+STAGING_DIRS = {"115", "downloads", "download", "staging", "strm", "tmp", "temp"}
+
+
+# 目录配置的分隔符：英文/中文逗号、分号、换行都算，多个目录可以写在一格里
+DIR_SEP_RE = re.compile(r"[,，;；\n\r]+")
+
+# 提取「作品名核心」时要剥掉的噪声：分辨率、来源、编码、音轨、压制组等。
+# 字幕名和转移历史里的原始资源名都会带这些，剥掉之后才能对到同一部作品。
+RE_TECH = re.compile(
+    r"\b(?:"
+    r"2160p|1080[pi]|720p|480p|4k|8k|uhd|hdr10|hdr|dolby\W?vision|dovi|sdr|"
+    r"blu\W?ray|bdrip|bd\W?remux|bdremux|brrip|remux|"
+    r"web\W?(?:dl|rip)|webrip|hdtv|pdtv|sdtv|dvdrip|dvd|hdrip|"
+    r"hevc|x265|x264|h\.?265|h\.?264|avc|av1|mpeg[24]|vp9|"
+    r"10bit|8bit|12bit|hi10p|hi444p?|"
+    r"ddp?\+|ddp?[257]\s?[01]|dd[257]|ma[57]\s?[01]|"
+    r"eac3|e\W?ac3|atmos|truehd|dts\W?(?:hd|x|ma|es)?|flac|lpcm|pcm|opus|aac\d?|ac3|"
+    r"[2-8]\s?(?:ch|audio|channel|track)|multi\W?audio|"
+    r"complete|repack|proper|uncut|remastered|restored|imax|"
+    r"内嵌|字幕组|压制组|高清|中字|简体|繁体|简中|繁中|国语|粤语"
+    r")\b",
+    re.I,
+)
 
 # 分类目录名：向上查找标题线索时跳过，避免「电影」「欧美剧」这类目录名参与打分
 CATEGORY_DIRS = {
@@ -113,15 +144,37 @@ class TvEntry:
     seasons: Dict[int, Dict[int, Path]] = field(default_factory=dict)
 
 
-def parse_lang_tag(stem: str) -> Tuple[str, bool]:
-    """从文件名中剥离语言标记，返回 (语言标签, 是否中文)。"""
+@dataclass
+class XferRecord:
+    """一条 MoviePilot 转移历史记录，压缩成匹配所需的最小信息。"""
+
+    src_full: str  # 原始资源名归一化后的形式，用于完全相同的情况
+    src_core: str  # 原始资源名剥离噪声后的作品名核心
+    tokens: Tuple[str, ...]  # src_core 按空格切分
+    dest_stem: str  # 整理后落地的文件名（不含扩展名）
+    title: str  # MP 识别出的标题（通常是中文名）
+    year: str  # MP 识别出的年份
+    mtype: str  # 电影 / 电视剧
+    seasons: List[int] = field(default_factory=list)
+    episodes: List[int] = field(default_factory=list)
+
+
+def strip_lang_tag(stem: str) -> str:
+    """去掉文件名里的语言标记，返回干净的基础名。"""
     name = stem
-    matched = ""
-    for rx, lang in LANG_TAGS:
+    for rx, _ in LANG_TAGS:
         m = rx.search(name)
         if m:
+            return (name[: m.start()] + name[m.end():]).strip(".-_ ")
+    return name
+
+
+def parse_lang_tag(stem: str) -> Tuple[str, bool]:
+    """从文件名中剥离语言标记，返回 (语言标签, 是否中文)。"""
+    matched = ""
+    for rx, lang in LANG_TAGS:
+        if rx.search(stem):
             matched = lang
-            name = (name[: m.start()] + name[m.end():]).strip(".-_ ")
             break
     return matched or "zh", matched.startswith("zh")
 
@@ -195,6 +248,62 @@ def title_key(s: str) -> str:
     n = normalize(s)
     n = re.sub(r"\b(the|a|an|of|and|or)\b", " ", n)
     return re.sub(r"\s+", " ", n).strip()
+
+
+def core_key(s: str) -> str:
+    """提取作品名核心：剥掉年份、季集号、分辨率、编码、音轨等一切噪声。
+
+    字幕名（`Avengers.Infinity.War.2018.2160p.WEB-DL.chs`）与转移历史里的
+    原始资源名（`Avengers Infinity War 2018 UHD BluRay REMUX 2160p HEVC ...`）
+    发行批次不同，逐字符对不上，但剥完之后都还原成 `avengers infinity war`。
+    """
+    n = RE_TECH.sub(" ", normalize(s))
+    n = re.sub(r"\b(?:s\d{1,2}\s*e?\s*\d{1,3}|e\d{1,3}|ep\d{1,3})\b", " ", n)
+    n = re.sub(r"\b(?:19|20)\d{2}\b", " ", n)
+    n = re.sub(r"\b(?:the|a|an|of|and|or|to|in|on|at|vs|part)\b", " ", n)
+    n = re.sub(r"[^0-9a-z㐀-鿿豈-﫿]+", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def loose_title(s: str) -> str:
+    """只保留中文与数字的标题指纹，忽略标点差异（全角冒号、半角冒号、空格等）。"""
+    return "".join(re.findall(r"[0-9㐀-鿿豈-﫿]", str(s or "")))
+
+
+def title_eq(a: str, b: str) -> bool:
+    """标题是否指向同一部作品：先精确比，再比中文+数字指纹。"""
+    if not a or not b:
+        return False
+    if a.strip() == b.strip():
+        return True
+    la, lb = loose_title(a), loose_title(b)
+    return bool(la) and la == lb
+
+
+def stem_of(path_str: Any) -> str:
+    """从任意路径字符串中取出不含扩展名的文件名，容忍分隔符与多层扩展名。"""
+    s = str(path_str or "").strip().rstrip("/\\")
+    if not s:
+        return ""
+    name = re.split(r"[\\/]", s)[-1]
+    if not name.startswith("."):
+        name = name.rsplit(".", 1)[0]
+    return name.strip()
+
+
+def int_list(value: Any) -> List[int]:
+    """把 `S01` / `1,2` / `08-09` 这类字段解析成整数列表。"""
+    out: List[int] = []
+    for m in re.finditer(r"\d{1,3}", str(value or "")):
+        n = int(m.group())
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def split_paths(raw: Any) -> List[str]:
+    """把一格里的多个路径拆开，支持英文/中文逗号、分号与换行。"""
+    return [p.strip() for p in DIR_SEP_RE.split(str(raw or "")) if p.strip()]
 
 
 def has_chinese_chars(s: str) -> bool:
@@ -322,28 +431,59 @@ def score_candidate(title: str, stem: str, ancestor_keys: List[str],
     return score, max_lcs, strong
 
 
-def library_owner(strm: Path) -> Optional[Path]:
-    """返回 strm 所属的「剧名 (年份)」目录；不符合结构则返回 None。
+def is_staging(lib: Path) -> bool:
+    """判断目录是否位于 115 中转 / 暂存区下面。
 
-    这是区分「真正的媒体库」与「115 中转目录 / 下载目录」的关键：
-    中转目录里的 strm 是平铺的，取不到「剧名 (年份)」这一层，直接判否。
+    这些目录里的 strm 还没进最终媒体库，字幕落在这里会跟着中转文件一起被
+    折腾掉，所以必须在这里就挡住。
+    """
+    p = lib
+    while p != p.parent:
+        if p.name.lower() in STAGING_DIRS:
+            return True
+        p = p.parent
+    return False
+
+
+def entry_meta(strm: Path) -> Optional[Tuple[str, str, Path]]:
+    """解析一个 strm 属于哪部作品，返回 (剧名, 年份, 所属目录)。
+
+    两种目录写法都认：
+      1) 目录名就是「剧名 (年份)」——`电影/外语电影/F1：狂飙飞车 (2025)/...`
+      2) 目录名只有剧名、年份写在文件名里——
+         `电影/外语电影/复仇者联盟3：无限战争/复仇者联盟3：无限战争 (2018) - 2160p.strm`
+    两种结构在同一套媒体库里混着放，只认一种会漏掉整整一片电影。
     """
     d = strm.parent
     lib = d.parent if RE_SEASON_DIR.match(d.name) else d
-    return lib if RE_LIB_DIR.match(lib.name) else None
+    if is_staging(lib):
+        return None
+    m = RE_LIB_DIR.match(lib.name)
+    if m:
+        return m.group("title"), m.group("year"), lib
+    m = RE_LIB_PREFIX.match(strm.stem)
+    if m:
+        return m.group("title"), m.group("year"), lib
+    return None
+
+
+def library_owner(strm: Path) -> Optional[Path]:
+    """返回 strm 所属的作品目录；不是最终媒体库结构则返回 None。"""
+    meta = entry_meta(strm)
+    return meta[2] if meta else None
 
 
 def build_movie_entries(strm_files: List[Path]) -> List[MovieEntry]:
     """按目标目录中的 strm 列表构建电影候选条目。"""
     groups: Dict[Path, MovieEntry] = {}
     for strm in strm_files:
-        d = strm.parent
-        if d not in groups:
-            m = RE_LIB_DIR.search(d.name)
-            if not m:
-                continue
-            groups[d] = MovieEntry(title=m.group("title"), year=m.group("year"))
-        groups[d].strm_files.append(strm)
+        meta = entry_meta(strm)
+        if not meta:
+            continue
+        title, year, lib = meta
+        if lib not in groups:
+            groups[lib] = MovieEntry(title=title, year=year)
+        groups[lib].strm_files.append(strm)
     return list(groups.values())
 
 
@@ -354,33 +494,245 @@ def build_tv_entries(strm_files: List[Path]) -> List[TvEntry]:
         se = RE_TV_EPISODE.search(strm.stem)
         if not se:
             continue
-        d = strm.parent
-        lib_dir = d.parent if RE_SEASON_DIR.match(d.name) else d
-        if lib_dir not in groups:
-            m = RE_LIB_DIR.search(lib_dir.name)
-            if not m:
-                continue
-            groups[lib_dir] = TvEntry(title=m.group("title"), year=m.group("year"))
-        groups[lib_dir].seasons.setdefault(int(se.group(1)), {})[int(se.group(2))] = strm
+        meta = entry_meta(strm)
+        if not meta:
+            continue
+        title, year, lib = meta
+        if lib not in groups:
+            groups[lib] = TvEntry(title=title, year=year)
+        groups[lib].seasons.setdefault(int(se.group(1)), {})[int(se.group(2))] = strm
     return list(groups.values())
+
+
+def fetch_transfer_rows(limit: int = 20000) -> Optional[List[Any]]:
+    """读取 MoviePilot 转移历史表。
+
+    模型类与静态方法的形态在不同 MP 版本间有差异，这里把常见的几个导入位置
+    逐个尝试并全量兜底；只要拿不到就返回 None，调用方自动退回启发式匹配，
+    不会影响同步本身。
+    """
+    model = None
+    for mod_path, attr in (("app.db.models.transferhistory", "TransferHistory"),
+                           ("app.db.oper.transferhistory", "TransferHistoryOper"),
+                           ("app.db.models.oper.transferhistory", "TransferHistoryOper")):
+        try:
+            module = importlib.import_module(mod_path)
+            model = getattr(module, attr, None) or getattr(module, "TransferHistory", None)
+        except Exception:
+            continue
+        if model is not None:
+            break
+    if model is None:
+        return None
+    query = (getattr(model, "list_by_page", None)
+             or getattr(model, "get_all", None)
+             or getattr(model, "list_by_date", None))
+    if not callable(query):
+        return None
+    called = False
+    for kwargs in ({"page": 1, "count": limit, "status": True},
+                   {"page": 1, "count": limit},
+                   {"date": "1970-01-01 00:00:00"},
+                   {}):
+        try:
+            rows = query(**kwargs)
+            called = True
+        except TypeError:
+            continue
+        except Exception:
+            return None
+        if rows:
+            return list(rows)[:limit]
+    # 一次都没调用成功 = 压根不知道 MP 这边长什么样，按「取不到」处理
+    return [] if called else None
+
+
+
+class TransferIndex:
+    """转移历史对照表：原始资源名 → 整理后的作品。"""
+
+    def __init__(self, rows: Optional[List[Any]] = None) -> None:
+        self.records: List[XferRecord] = []
+        self.by_full: Dict[str, List[int]] = defaultdict(list)
+        self.by_token: Dict[str, List[int]] = defaultdict(list)
+        self.freq: Dict[str, int] = defaultdict(int)
+        if rows is None:
+            return
+        for row in rows:
+            rec = self._to_record(row)
+            if not rec:
+                continue
+            idx = len(self.records)
+            self.records.append(rec)
+            self.by_full[rec.src_full].append(idx)
+            for tok in set(rec.tokens):
+                self.by_token[tok].append(idx)
+                self.freq[tok] += 1
+
+    @staticmethod
+    def _to_record(row: Any) -> Optional[XferRecord]:
+        """把一行 ORM 记录压成 XferRecord；缺少可用信息就丢弃这条。"""
+        src = getattr(row, "src", None)
+        src_stem = stem_of(src)
+        core = core_key(src_stem)
+        if not core:
+            return None
+        return XferRecord(
+            src_full=title_key(src_stem),
+            src_core=core,
+            tokens=tuple(core.split()),
+            dest_stem=stem_of(getattr(row, "dest", None)),
+            title=str(getattr(row, "title", "") or "").strip(),
+            year=str(getattr(row, "year", "") or "").strip(),
+            mtype=str(getattr(row, "type", "") or "").strip(),
+            seasons=int_list(getattr(row, "seasons", "")),
+            episodes=int_list(getattr(row, "episodes", "")),
+        )
+
+    def lookup(self, stem: str, year: Optional[str]) -> Optional[XferRecord]:
+        """找出与字幕名最贴合的一条转移记录；证据不足时返回 None。"""
+        if not self.records:
+            return None
+        # 先摘掉 .chs/.en 之类的语言尾巴，否则它会算进比对词里、把覆盖率稀释掉
+        stem = strip_lang_tag(stem)
+
+        # 完全同名：字幕和原始资源出自同一次发布，最强的证据
+        full = title_key(stem)
+        if full and full in self.by_full:
+            rec = self.records[self.by_full[full][0]]
+            if not (year and rec.year and rec.year != year):
+                return rec
+
+        core = core_key(stem)
+        toks = [t for t in core.split() if len(t) > 1]
+        if not toks:
+            return None
+        # 用最稀有的词缩小候选集，避免每条字幕都全表比对
+        pool: Optional[List[int]] = None
+        for tok in sorted(toks, key=lambda t: self.freq.get(t, 0)):
+            idxs = self.by_token.get(tok)
+            if idxs:
+                pool = idxs
+                break
+        if not pool:
+            return None
+
+        # 整条字幕只剩一个词时（如 `Dune.srt` / `三体.srt`），只有这个词足够长、
+        # 或者本身就是一个完整中文片名，才允许凭一词命中，否则宁可不放也不放错
+        single_ok = (len(toks) == 1
+                     and (len(toks[0]) >= 4 or len(CJK_RE.findall(toks[0])) >= 2))
+
+        best: Optional[XferRecord] = None
+        best_score = 0.0
+        for i in pool:
+            rec = self.records[i]
+            if year and rec.year and rec.year != year:
+                continue
+            hit = sum(1 for t in toks if t in rec.tokens)
+            cov = hit / len(toks)
+            if hit < 2 and not (hit == 1 and single_ok):
+                continue
+            if cov < 0.8:
+                continue
+            score = cov + hit * 0.01
+            # 前缀命中说明字幕名就是原始资源名的主体，比只是包含更可信
+            if rec.src_core == core:
+                score += 0.5
+            elif rec.src_core.startswith(core + " "):
+                score += 0.2
+            if score > best_score:
+                best_score = score
+                best = rec
+        return best
+
+
+def build_strm_stem_index(strms: List[Path]) -> Dict[str, List[Path]]:
+    """按文件名建立 strm 索引，用于把转移历史里的目标文件名直接对上媒体库文件。"""
+    out: Dict[str, List[Path]] = defaultdict(list)
+    for s in strms:
+        out[s.stem.lower()].append(s)
+    return dict(out)
+
+
+def resolve_strm(rec: XferRecord, season: Optional[int], episode: Optional[int],
+                 movie_entries: List[MovieEntry], tv_entries: List[TvEntry],
+                 strm_by_stem: Dict[str, List[Path]]) -> Optional[Path]:
+    """把一条转移记录落到媒体库里具体的 strm 文件；落不上去返回 None。
+
+    字幕带 SxxExx 就说明这是某一集的料，只在剧集里按季集号精确定位——
+    电影和剧集完全可能同名（《沙丘》），剧集那条对不上时宁可整条放弃，
+    也不能退到电影里去，否则整季的字幕会一起塞进电影目录。
+    """
+
+    # ① 整理后的文件名与媒体库 strm 同名（MP 整理出的名字与最终 strm 一致）
+    if rec.dest_stem:
+        hit = strm_by_stem.get(rec.dest_stem.lower())
+        if hit:
+            return hit[0]
+
+    # MP 的 title 偶尔是空的，这时 dest 所在目录名就是剧名，拿来顶上
+    title_hint = rec.title or rec.dest_stem
+    is_episode = season is not None and episode is not None
+
+    # ② 剧集：字幕的季集号 + 转移记录 + 媒体库三者对上
+    if is_episode:
+        for tv in tv_entries:
+            if not title_eq(tv.title, title_hint):
+                continue
+            if rec.year and tv.year and rec.year != tv.year:
+                continue
+            if rec.seasons and season not in rec.seasons:
+                continue
+            strm = tv.seasons.get(season, {}).get(episode)
+            if strm:
+                return strm
+        return None
+
+    # ③ 电影：标题 + 年份对上
+    for mv in movie_entries:
+        if not title_eq(mv.title, title_hint):
+            continue
+        if rec.year and mv.year and rec.year != mv.year:
+            continue
+        if mv.strm_files:
+            return mv.strm_files[0]
+    return None
 
 
 def plan_for_subtitle(sub: SubtitleFile, movie_entries: List[MovieEntry],
                       tv_entries: List[TvEntry],
-                      alias_map: Dict[str, Set[str]]) -> Optional[Plan]:
-    """为单条字幕在候选库中寻找目标 strm。"""
+                      alias_map: Dict[str, Set[str]],
+                      xfer: Optional[TransferIndex] = None,
+                      strm_by_stem: Optional[Dict[str, List[Path]]] = None) -> Optional[Plan]:
+    """为单条字幕在候选库中寻找目标 strm。
+
+    匹配优先级：转移历史对照表（零猜测）→ 中文 LCS / 英文整词启发式 → 别名映射。
+    """
     stem = sub.stem
     stem_key = title_key(stem)
     year = extract_year(stem)
     ancestor_keys = collect_ancestor_keys(sub.path)
+    season_ep = extract_season_episode(stem)
+    season, episode = season_ep if season_ep else (None, None)
 
+    # ① 转移历史对照表：MP 自己已经知道这部片子整理后叫什么，直接照抄，零猜测
+    if xfer is not None and xfer.records:
+        rec = xfer.lookup(stem, year)
+        if rec:
+            strm = resolve_strm(rec, season, episode, movie_entries, tv_entries,
+                                strm_by_stem or {})
+            if strm:
+                dst = strm.parent / f"{strm.stem}.{sub.lang}{sub.path.suffix.lower()}"
+                return Plan(src=sub.path, dst=dst,
+                            reason=f"转移历史匹配: {strm.name}")
+
+    # ② 启发式匹配
     alias_hits: Set[str] = set()
     for at in ancestor_keys + [stem_key]:
         for tok in at.split():
             if tok in alias_map:
                 alias_hits.update(alias_map[tok])
 
-    season_ep = extract_season_episode(stem)
     if season_ep:
         season, episode = season_ep
         candidates: List[Tuple[int, int, int, TvEntry]] = []
@@ -470,7 +822,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -481,6 +833,7 @@ class SubSync(_PluginBase):
     _overwrite = False
     _delete_source = False
     _chinese_only = True
+    _use_transfer_history = True
     _recent_window = 86400.0
     _download_movie = ""
     _download_tv = ""
@@ -496,6 +849,7 @@ class SubSync(_PluginBase):
         self._overwrite = False
         self._delete_source = False
         self._chinese_only = True
+        self._use_transfer_history = True
         self._recent_window = 86400.0
         self._download_movie = ""
         self._download_tv = ""
@@ -510,6 +864,7 @@ class SubSync(_PluginBase):
         # 默认关闭源文件清理：删除不可逆，需用户显式开启
         self._delete_source = bool(config.get("delete_source", False))
         self._chinese_only = bool(config.get("chinese_only", True))
+        self._use_transfer_history = bool(config.get("use_transfer_history", True))
         try:
             days = float(config.get("recent_window_days", 1) or 1)
         except (TypeError, ValueError):
@@ -616,12 +971,20 @@ class SubSync(_PluginBase):
                                         "label": "复制后删除源字幕",
                                         "color": "error", "hideDetails": True}}]},
             ]},
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6},
+                 "content": [{"component": "VSwitch",
+                              "props": {"model": "use_transfer_history",
+                                        "label": "用转移历史自动匹配",
+                                        "color": "primary",
+                                        "hideDetails": True}}]},
+            ]},
         ]
 
         # ---- 路径分组 ----
-        form += self._form_group("目录路径（填 MoviePilot 容器内可见的路径）", [
-            ("download_movie", "下载目录 · 电影", "/media/downloads/电影"),
-            ("download_tv", "下载目录 · 剧集", "/media/downloads/电视剧"),
+        form += self._form_group("目录路径（容器内路径，多个用英文逗号隔开）", [
+            ("download_movie", "下载目录 · 电影", "/media/downloads/电影,/media/待上传"),
+            ("download_tv", "下载目录 · 剧集", "/media/downloads/电视剧,/media/待上传"),
             ("library_movie", "媒体库目录 · 电影", "/media/电影"),
             ("library_tv", "媒体库目录 · 剧集", "/media/电视剧"),
         ])
@@ -632,16 +995,16 @@ class SubSync(_PluginBase):
             ("recent_window_days", "事件通道扫描窗口 · 天", "1"),
         ])
 
-        # ---- 别名映射（可选） ----
+        # ---- 别名映射（兜底，可留空） ----
         form += [
             {"component": "VDivider", "props": {}},
             {"component": "VAlert",
              "props": {"variant": "text", "density": "compact",
-                       "title": "别名映射（可选）"}},
+                       "title": "别名映射（兜底，可留空）"}},
             {"component": "VTextarea",
              "props": {"model": "alias", "variant": "outlined", "rows": 3,
                        "placeholder": "from|梦魇绝镇",
-                       "hint": "只有字幕文件名与剧集名对不上时才需要，例如英文资源名。每行：英文别名|中文剧名",
+                       "hint": "转移历史与自动匹配都对不上时才需要。每行：英文别名|中文剧名",
                        "persistentHint": True}},
         ]
 
@@ -659,8 +1022,9 @@ class SubSync(_PluginBase):
             "chinese_only": True,
             "overwrite": False,
             "delete_source": False,
-            "download_movie": "/media/downloads/电影",
-            "download_tv": "/media/downloads/电视剧",
+            "use_transfer_history": True,
+            "download_movie": "/media/downloads/电影,/media/待上传",
+            "download_tv": "/media/downloads/电视剧,/media/待上传",
             "library_movie": "/media/电影",
             "library_tv": "/media/电视剧",
             "backfill_cron": "30 4 * * *",
@@ -699,23 +1063,35 @@ class SubSync(_PluginBase):
         return total, capped
 
     def _config_problems(self) -> List[str]:
-        """逐项校验四个关键路径，返回问题列表；空列表表示配置正常。"""
+        """逐项校验关键路径，返回问题列表；空列表表示配置正常。
+
+        一格里的多个目录是「或」关系：只要有一个能用就算配好了。少写的那些
+        不算错误，免得升级后默认带上的路径在你机器上不存在就平白飘红。
+        """
         out: List[str] = []
         for raw, label in ((self._download_tv, "下载目录·剧集"),
                           (self._download_movie, "下载目录·电影"),
                           (self._library_tv, "媒体库·剧集"),
                           (self._library_movie, "媒体库·电影")):
-            if not raw or not raw.strip():
+            items = split_paths(raw)
+            if not items:
                 out.append(f"{label} 未填写")
                 continue
-            try:
-                p = Path(raw.strip())
-                if not p.exists():
-                    out.append(f"{label} 不存在 → {raw}")
-                elif not p.is_dir():
-                    out.append(f"{label} 不是目录 → {raw}")
-            except (OSError, ValueError):
-                out.append(f"{label} 路径非法 → {raw}")
+            usable = 0
+            bad: List[str] = []
+            for item in items:
+                try:
+                    p = Path(item)
+                    if p.exists() and p.is_dir():
+                        usable += 1
+                    else:
+                        bad.append(item)
+                except (OSError, ValueError):
+                    bad.append(item)
+            if not usable:
+                out.append(f"{label} 全部无效 → {'、'.join(bad)}")
+            elif bad:
+                logger.debug(f"[字幕同步] {label} 中这些路径不存在，已忽略: {bad}")
         return out
 
     def get_page(self) -> Optional[List[dict]]:
@@ -811,17 +1187,20 @@ class SubSync(_PluginBase):
     # ---------- 路径工具 ----------
 
     def _valid_dirs(self, raws: Tuple[str, ...]) -> List[Path]:
-        """把配置里的路径字符串解析为存在且去重后的目录列表。"""
+        """把配置里的路径字符串解析为存在且去重后的目录列表。
+
+        每格可以写多个目录，用英文/中文逗号或分号隔开——字幕既可能留在下载目录，
+        也可能被 MP 一起移进待上传目录，两个都填上就不用猜。
+        """
         dirs: List[Path] = []
         for raw in raws:
-            if not raw:
-                continue
-            p = Path(raw.strip())
-            try:
-                if p.exists() and p.is_dir() and p not in dirs:
-                    dirs.append(p)
-            except OSError:
-                continue
+            for item in split_paths(raw):
+                p = Path(item)
+                try:
+                    if p.exists() and p.is_dir() and p not in dirs:
+                        dirs.append(p)
+                except OSError:
+                    continue
         return dirs
 
     def _source_dirs(self) -> List[Path]:
@@ -845,8 +1224,9 @@ class SubSync(_PluginBase):
                 continue
         return False
 
-    def _collect_library_index(self) -> Tuple[List[MovieEntry], List[TvEntry], int]:
-        """扫描媒体库建立全量索引，只收录位于「剧名 (年份)」目录下的 strm。"""
+    def _collect_library_index(self) -> Tuple[List[MovieEntry], List[TvEntry], int,
+                                              Dict[str, List[Path]]]:
+        """扫描媒体库建立全量索引，只收录属于最终媒体库的 strm。"""
         strms: List[Path] = []
         for root in self._library_dirs():
             try:
@@ -855,13 +1235,36 @@ class SubSync(_PluginBase):
                         strms.append(p)
             except OSError as exc:
                 logger.warning(f"[字幕同步] 扫描媒体库失败 {root}: {exc}")
-        return build_movie_entries(strms), build_tv_entries(strms), len(strms)
+        return (build_movie_entries(strms), build_tv_entries(strms), len(strms),
+                build_strm_stem_index(strms))
+
+    def _transfer_index(self) -> Optional[TransferIndex]:
+        """构建转移历史对照表。读不到就返回空表，匹配自动退回启发式。"""
+        if not self._use_transfer_history:
+            return None
+        try:
+            rows = fetch_transfer_rows()
+        except Exception as exc:
+            logger.warning(f"[字幕同步] 读取转移历史失败，改用启发式匹配: {exc}")
+            return None
+        if rows is None:
+            logger.warning("[字幕同步] 取不到转移历史表，本次改用启发式匹配")
+            return None
+        idx = TransferIndex(rows)
+        if idx.records:
+            logger.info(f"[字幕同步] 转移历史对照表已载入 {len(idx.records)} 条记录")
+        else:
+            logger.warning("[字幕同步] 转移历史里没有可用记录，本次改用启发式匹配")
+        return idx
 
     # ---------- 两条处理通道 ----------
 
     def _match_and_apply(self, subs: List[SubtitleFile],
                          movie_entries: List[MovieEntry], tv_entries: List[TvEntry],
-                         source_dirs: List[Path]) -> Tuple[int, int, int, int]:
+                         source_dirs: List[Path],
+                         xfer: Optional[TransferIndex] = None,
+                         strm_by_stem: Optional[Dict[str, List[Path]]] = None) \
+            -> Tuple[int, int, int, int]:
         """对字幕做匹配与复制，返回 (成功, 跳过, 失败, 未匹配)。"""
         alias_map = load_alias_text(self._alias)
         plans: List[Plan] = []
@@ -870,7 +1273,8 @@ class SubSync(_PluginBase):
             try:
                 if not self._allowed_source(sub.path, source_dirs):
                     continue
-                plan = plan_for_subtitle(sub, movie_entries, tv_entries, alias_map)
+                plan = plan_for_subtitle(sub, movie_entries, tv_entries, alias_map,
+                                         xfer, strm_by_stem)
             except Exception as exc:  # 单条失败不能拖垮整批
                 missed += 1
                 logger.warning(f"[字幕同步] 处理字幕时出错 {sub.path}: {exc}")
@@ -910,10 +1314,10 @@ class SubSync(_PluginBase):
         except OSError as exc:
             logger.warning(f"[字幕同步] 扫描目标目录失败 {target_root}: {exc}")
             return
-        # 只认「剧名 (年份)」结构；115 中转目录等平铺 strm 会在这里被跳过
+        # 只认最终媒体库；115 中转目录等暂存区的 strm 会在这里被跳过
         strm_files = [s for s in strm_files if library_owner(s) is not None]
         if not strm_files:
-            logger.debug(f"[字幕同步] {target_root} 下没有媒体库结构的 strm，本次跳过")
+            logger.debug(f"[字幕同步] {target_root} 下没有最终媒体库的 strm，本次跳过")
             return
 
         source_dirs = self._source_dirs()
@@ -932,7 +1336,9 @@ class SubSync(_PluginBase):
 
         movie_entries = build_movie_entries(strm_files)
         tv_entries = build_tv_entries(strm_files)
-        ok, skip, fail, missed = self._match_and_apply(subs, movie_entries, tv_entries, source_dirs)
+        ok, skip, fail, missed = self._match_and_apply(
+            subs, movie_entries, tv_entries, source_dirs,
+            self._transfer_index(), build_strm_stem_index(strm_files))
         if missed:
             logger.info(f"[字幕同步] 共扫描 {len(subs)} 条字幕，{missed} 条未匹配")
         if ok or fail:
@@ -946,9 +1352,9 @@ class SubSync(_PluginBase):
         if not self._library_dirs():
             return "全库补扫失败：未找到有效的媒体库目录，请检查插件设置里的两个媒体库目录"
 
-        movie_entries, tv_entries, strm_count = self._collect_library_index()
+        movie_entries, tv_entries, strm_count, strm_by_stem = self._collect_library_index()
         if not movie_entries and not tv_entries:
-            return "全库补扫失败：媒体库里没有识别到「剧名 (年份)」结构的条目"
+            return "全库补扫失败：媒体库里没有识别到有效的条目（目录名带年份，或年份写在文件名里）"
 
         subs: List[SubtitleFile] = []
         for d in source_dirs:
@@ -958,7 +1364,9 @@ class SubSync(_PluginBase):
             return f"全库补扫：媒体库索引 {strm_count} 个 strm，下载目录里没有字幕文件"
 
         t0 = time.time()
-        ok, skip, fail, missed = self._match_and_apply(subs, movie_entries, tv_entries, source_dirs)
+        ok, skip, fail, missed = self._match_and_apply(subs, movie_entries, tv_entries,
+                                                       source_dirs, self._transfer_index(),
+                                                       strm_by_stem)
         cost = time.time() - t0
         msg = (f"全库补扫完成（{cost:.1f}s）：媒体库 {strm_count} 个 strm / "
                f"{len(movie_entries) + len(tv_entries)} 个条目，扫描字幕 {len(subs)} 条 → "
