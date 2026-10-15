@@ -470,7 +470,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -563,118 +563,98 @@ class SubSync(_PluginBase):
             }
         ]
 
+    @staticmethod
+    def _form_group(title: str, items: List[Tuple[str, str, str]]) -> List[dict]:
+        """生成一个分组：标题 + 两列排布的配置项。
+
+        items 每项为 (model, label, placeholder)。
+        """
+        cols = [
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "sm": 6, "md": 6},
+                "content": [{
+                    "component": "VTextField",
+                    "props": {"model": model, "label": label,
+                              "placeholder": placeholder, "variant": "outlined",
+                              "density": "comfortable", "hideDetails": True},
+                }],
+            }
+            for model, label, placeholder in items
+        ]
+        return [
+            {"component": "VDivider", "props": {}},
+            {"component": "VAlert",
+             "props": {"variant": "text", "density": "compact", "title": title}},
+            {"component": "VRow", "content": cols},
+        ]
+
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
         """返回插件配置表单与默认配置。"""
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VSwitch",
-                        "props": {"model": "enabled", "label": "启用插件"},
-                    },
-                    {
-                        "component": "VSwitch",
-                        "props": {"model": "chinese_only", "label": "仅同步中文字幕"},
-                    },
-                    {
-                        "component": "VSwitch",
-                        "props": {"model": "overwrite", "label": "覆盖已存在的目标字幕"},
-                    },
-                    {
-                        "component": "VSwitch",
-                        "props": {
-                            "model": "delete_source",
-                            "label": "复制成功后删除下载目录的源字幕（释放空间）",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "download_movie",
-                            "label": "下载目录（电影）",
-                            "placeholder": "/media/downloads/电影",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "download_tv",
-                            "label": "下载目录（剧集）",
-                            "placeholder": "/media/downloads/电视剧",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "library_movie",
-                            "label": "媒体库目录（电影）",
-                            "placeholder": "/media/电影",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "library_tv",
-                            "label": "媒体库目录（剧集）",
-                            "placeholder": "/media/电视剧",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "backfill_cron",
-                            "label": "全库补扫定时（crontab 格式，留空则每天 04:30）",
-                            "placeholder": "30 4 * * *",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "recent_window_days",
-                            "label": "事件通道的下载目录扫描时间窗口（天）",
-                            "placeholder": "1",
-                        },
-                    },
-                    {
-                        "component": "VTextarea",
-                        "props": {
-                            "model": "alias",
-                            "label": "别名映射（每行：英文别名|中文剧名A|中文剧名B）",
-                            "placeholder": "from|梦魇绝镇|迷离小镇",
-                            "rows": 4,
-                        },
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "text": "字幕一定落在对应 strm 所在的目录，不需要在这里填分类规则。"
-                                    "媒体库只需配置到分类根目录（如 /media/电影），插件会自动向下"
-                                    "识别「剧名 (年份)」结构；115 中转目录因为没有这个结构会被自动跳过。",
-                        },
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "warning",
-                            "text": "「复制成功后删除源字幕」默认关闭。开启后字幕会被移动到媒体库，"
-                                    "下载目录中的原文件不再保留，且无法自动恢复。"
-                                    "仅在确认字幕已正确入库后再开启。",
-                        },
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "text": "所有路径都按 MoviePilot 容器内看到的路径填写。"
-                                    "若宿主机是 /volume1/Media 而容器内挂载为 /media，"
-                                    "这里应填 /media/... 。可执行 ls 确认。",
-                        },
-                    },
-                ],
-            }
-        ], {
+        form: List[dict] = [
+            # ---- 开关：两列并排 ----
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6},
+                 "content": [{"component": "VSwitch",
+                              "props": {"model": "enabled", "label": "启用插件",
+                                        "color": "primary", "hideDetails": True}}]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6},
+                 "content": [{"component": "VSwitch",
+                              "props": {"model": "chinese_only",
+                                        "label": "仅同步中文字幕",
+                                        "hideDetails": True}}]},
+            ]},
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6},
+                 "content": [{"component": "VSwitch",
+                              "props": {"model": "overwrite",
+                                        "label": "覆盖已存在的字幕",
+                                        "hideDetails": True}}]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6},
+                 "content": [{"component": "VSwitch",
+                              "props": {"model": "delete_source",
+                                        "label": "复制后删除源字幕",
+                                        "color": "error", "hideDetails": True}}]},
+            ]},
+        ]
+
+        # ---- 路径分组 ----
+        form += self._form_group("目录路径（填 MoviePilot 容器内可见的路径）", [
+            ("download_movie", "下载目录 · 电影", "/media/downloads/电影"),
+            ("download_tv", "下载目录 · 剧集", "/media/downloads/电视剧"),
+            ("library_movie", "媒体库目录 · 电影", "/media/电影"),
+            ("library_tv", "媒体库目录 · 剧集", "/media/电视剧"),
+        ])
+
+        # ---- 调度分组 ----
+        form += self._form_group("运行节奏", [
+            ("backfill_cron", "全库补扫 · crontab", "30 4 * * *"),
+            ("recent_window_days", "事件通道扫描窗口 · 天", "1"),
+        ])
+
+        # ---- 别名映射（可选） ----
+        form += [
+            {"component": "VDivider", "props": {}},
+            {"component": "VAlert",
+             "props": {"variant": "text", "density": "compact",
+                       "title": "别名映射（可选）"}},
+            {"component": "VTextarea",
+             "props": {"model": "alias", "variant": "outlined", "rows": 3,
+                       "placeholder": "from|梦魇绝镇",
+                       "hint": "只有字幕文件名与剧集名对不上时才需要，例如英文资源名。每行：英文别名|中文剧名",
+                       "persistentHint": True}},
+        ]
+
+        # ---- 唯一保留的警示：不可逆操作 ----
+        form += [
+            {"component": "VDivider", "props": {}},
+            {"component": "VAlert",
+             "props": {"variant": "tonal", "type": "warning", "density": "compact",
+                       "text": "「复制后删除源字幕」开启后，源字幕会被移除且无法恢复。"
+                               "确认字幕已正确入库再开。"}},
+        ]
+
+        return [{"component": "VForm", "content": form}], {
             "enabled": True,
             "chinese_only": True,
             "overwrite": False,
@@ -718,30 +698,31 @@ class SubSync(_PluginBase):
                 break
         return total, capped
 
-    def _path_lines(self) -> str:
-        """把四个关键路径的可读状态拼成一段文字。"""
-        def fmt(raw: str, root: str) -> str:
-            if not raw:
-                return f"{root}：未填写"
+    def _config_problems(self) -> List[str]:
+        """逐项校验四个关键路径，返回问题列表；空列表表示配置正常。"""
+        out: List[str] = []
+        for raw, label in ((self._download_tv, "下载目录·剧集"),
+                          (self._download_movie, "下载目录·电影"),
+                          (self._library_tv, "媒体库·剧集"),
+                          (self._library_movie, "媒体库·电影")):
+            if not raw or not raw.strip():
+                out.append(f"{label} 未填写")
+                continue
             try:
                 p = Path(raw.strip())
+                if not p.exists():
+                    out.append(f"{label} 不存在 → {raw}")
+                elif not p.is_dir():
+                    out.append(f"{label} 不是目录 → {raw}")
             except (OSError, ValueError):
-                return f"{root}：{raw}（路径非法）"
-            if not p.exists():
-                return f"{root}：{raw}（不存在）"
-            if not p.is_dir():
-                return f"{root}：{raw}（不是目录）"
-            return f"{root}：{raw} ✓"
-
-        return "\n".join([
-            fmt(self._download_tv, "下载目录·剧集"),
-            fmt(self._download_movie, "下载目录·电影"),
-            fmt(self._library_tv, "媒体库·剧集"),
-            fmt(self._library_movie, "媒体库·电影"),
-        ])
+                out.append(f"{label} 路径非法 → {raw}")
+        return out
 
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：运行状态、配置自检、库内统计与最近一次补扫结果。"""
+        """插件详情页。
+
+        采用渐进披露：一切正常时只给状态与数字，有问题或有过补扫记录时才展开细节。
+        """
         src = self._source_dirs()
         lib = self._library_dirs()
         try:
@@ -751,109 +732,81 @@ class SubSync(_PluginBase):
 
         strm_count, _ = self._count_files(lib, {".strm"})
         sub_count, sub_capped = self._count_files(src, SUB_EXTS)
-        ready = bool(src) and bool(lib)
+        problems = self._config_problems()
+        has_last = bool(last.get("time"))
 
-        def tile(label: str, value: str, color: str) -> dict:
-            return {
-                "component": "VCol",
-                "props": {"cols": 12, "sm": 6, "md": 3},
-                "content": [{
-                    "component": "VAlert",
-                    "props": {
-                        "variant": "tonal",
-                        "type": "info",
-                        "color": color,
-                        "title": value,
-                        "text": label,
-                    },
-                }],
-            }
+        # ---- 统计磁贴：有补扫记录才显示那两个，否则只留两个基础数字 ----
+        tiles = [
+            ("媒体库 strm 数", str(strm_count), "primary"),
+            (f"下载目录字幕{'（截断）' if sub_capped else '数'}", str(sub_count), "secondary"),
+        ]
+        if has_last:
+            tiles.append(("上次补扫成功", str(last.get("ok", "—")), "success"))
+            tiles.append(("上次未匹配", str(last.get("missed", "—")), "warning"))
 
-        last_time = last.get("time") or "尚未执行"
-        last_msg = last.get("msg") or "还没有跑过全库补扫。发 /subsync_scan_all 可以立刻执行一次。"
+        cols = 12 // len(tiles)
+        tile_row = {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "sm": 6, "md": cols},
+                    "content": [{
+                        "component": "VAlert",
+                        "props": {"variant": "tonal", "type": "info",
+                                  "color": color, "title": value, "text": label},
+                    }],
+                }
+                for label, value, color in tiles
+            ],
+        }
 
-        return [
-            # ---- 运行状态 ----
+        blocks: List[dict] = [
+            # ---- 状态：正常时只有一行，不铺陈说明 ----
             {
                 "component": "VAlert",
                 "props": {
                     "variant": "tonal",
                     "type": "success" if self._enabled else "warning",
-                    "title": f"插件已启用 · v{self.plugin_version}" if self._enabled
+                    "title": f"运行中 · v{self.plugin_version}" if self._enabled
                              else "插件未启用",
-                    "text": "字幕会落在对应 strm 所在的目录，与媒体文件同目录、"
-                            "同名主体，仅多一个语言标签（如 .zh-Hans / .en）。"
-                            "不做分类推断，因此 115 中转目录不会被误写入。",
                 },
             },
-            # ---- 统计磁贴 ----
-            {
-                "component": "VRow",
-                "content": [
-                    tile("媒体库 strm 数", str(strm_count), "primary"),
-                    tile(f"下载目录字幕数{'（已截断统计）' if sub_capped else ''}",
-                         str(sub_count), "secondary"),
-                    tile("上次补扫成功", str(last.get("ok", "—")), "success"),
-                    tile("上次补扫未匹配", str(last.get("missed", "—")), "warning"),
-                ],
-            },
-            # ---- 配置自检 ----
-            {
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "success" if ready else "error",
-                    "title": "配置自检：已就绪" if ready else "配置不完整，插件不会工作",
-                    "text": self._path_lines(),
-                },
-            },
-            # ---- 最近一次补扫 ----
-            {
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "info",
-                    "title": f"最近一次全库补扫 · {last_time}",
-                    "text": last_msg,
-                },
-            },
-            # ---- 怎么触发 ----
-            {
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "info",
-                    "title": "怎么触发补扫",
-                    "text": f"① 在 MoviePilot 对话框发送 /subsync_scan_all 立刻执行一次；"
-                            f"② 等待每天 {self._backfill_cron or '04:30'} 自动补扫（可在设置里改）。"
-                            f"整理完成时的事件通道会自动处理刚下载的那一集，无需等待定时任务。",
-                },
-            },
-            # ---- 匹配规则说明 ----
-            {
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "info",
-                    "title": "什么时候能匹配上",
-                    "text": "• 中文剧名 + 正确的季集号 → 直接命中\n"
-                            "• 英文资源名（如 From） → 需要在「别名映射」里写一行 from|梦魇绝镇\n"
-                            "• 名字对不上时不猜、不乱配，宁可跳过；可在设置里把别名映射当映射表维护",
-                },
-            },
-            # ---- 常见问题 ----
-            {
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "warning",
-                    "title": "三个容易踩的坑",
-                    "text": "① 所有路径按容器内看到的填，不是宿主机路径\n"
-                            "② 插件市场里要点「同步插件源」，「刷新」只重画本地缓存\n"
-                            "③ 改代码后必须同步改三处版本号，否则 MP 认为没有新版本",
-                },
-            },
+            tile_row,
         ]
+
+        # ---- 配置自检：正常就一句话，出问题才展开 ----
+        if problems:
+            blocks.append({
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "error",
+                    "title": f"配置有 {len(problems)} 处问题",
+                    "text": " · ".join(problems),
+                },
+            })
+        else:
+            blocks.append({
+                "component": "VAlert",
+                "props": {"variant": "tonal", "type": "success",
+                          "title": "配置正常",
+                          "text": "四个路径均已生效"},
+            })
+
+        # ---- 补扫结果：跑过才显示 ----
+        if has_last:
+            blocks.append({
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "warning" if last.get("missed") else "info",
+                    "title": f"上次补扫 · {last.get('time')}",
+                    "text": last.get("msg") or "",
+                },
+            })
+
+        return blocks
 
     # ---------- 路径工具 ----------
 
