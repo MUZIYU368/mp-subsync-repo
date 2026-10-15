@@ -822,7 +822,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -1094,10 +1094,70 @@ class SubSync(_PluginBase):
                 logger.debug(f"[字幕同步] {label} 中这些路径不存在，已忽略: {bad}")
         return out
 
+    @staticmethod
+    def _stat_card(title: str, value: str, color: str, hint: str = "") -> dict:
+        """一张统计磁贴：大数字 + 小标题 + 一行补充说明。"""
+        content: List[dict] = [
+            {"component": "VCardSubtitle",
+             "props": {"class": "pb-0 text-caption text-medium-emphasis"},
+             "text": title},
+            {"component": "VCardTitle",
+             "props": {"class": "text-h5 pt-1 font-weight-bold"},
+             "text": value},
+        ]
+        if hint:
+            content.append({"component": "VCardSubtitle",
+                            "props": {"class": "text-caption pt-1"},
+                            "text": hint})
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "sm": 6, "md": 3},
+            "content": [{"component": "VCard",
+                         "props": {"variant": "tonal", "color": color,
+                                   "class": "pa-3 h-100"},
+                         "content": content}],
+        }
+
+    @staticmethod
+    def _info_row(label: str, value: str, muted: bool = False) -> dict:
+        """运行信息里的一行「标签 : 值」。"""
+        return {
+            "component": "div",
+            "props": {"class": "d-flex justify-space-between align-start ga-3 py-1"},
+            "content": [
+                {"component": "span",
+                 "props": {"class": "text-caption text-medium-emphasis flex-shrink-0"},
+                 "text": label},
+                {"component": "span",
+                 "props": {"class": "text-body-2 text-break"
+                                   + (" text-medium-emphasis" if muted else "")},
+                 "text": value},
+            ],
+        }
+
+    @staticmethod
+    def _panel(title: str, rows: List[dict], color: str = "primary") -> dict:
+        """一张带小标题的描边面板。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-3"},
+            "content": [{
+                "component": "div",
+                "props": {"class": "d-flex flex-column px-4 py-3"},
+                "content": [{
+                    "component": "div",
+                    "props": {"class": "text-subtitle-2 font-weight-bold mb-1"},
+                    "text": title,
+                }] + rows,
+            }],
+        }
+
     def get_page(self) -> Optional[List[dict]]:
         """插件详情页。
 
-        采用渐进披露：一切正常时只给状态与数字，有问题或有过补扫记录时才展开细节。
+        结构：状态条 → 四张统计磁贴 → 配置自检 → 运行信息 → 上次补扫。
+        一切正常时把自检结果收成状态条上的一枚小标签，不额外占地方；
+        只有真出问题才会铺开逐条告警。
         """
         src = self._source_dirs()
         lib = self._library_dirs()
@@ -1110,77 +1170,107 @@ class SubSync(_PluginBase):
         sub_count, sub_capped = self._count_files(src, SUB_EXTS)
         problems = self._config_problems()
         has_last = bool(last.get("time"))
+        enabled = self._enabled
 
-        # ---- 统计磁贴：有补扫记录才显示那两个，否则只留两个基础数字 ----
-        tiles = [
-            ("媒体库 strm 数", str(strm_count), "primary"),
-            (f"下载目录字幕{'（截断）' if sub_capped else '数'}", str(sub_count), "secondary"),
-        ]
-        if has_last:
-            tiles.append(("上次补扫成功", str(last.get("ok", "—")), "success"))
-            tiles.append(("上次未匹配", str(last.get("missed", "—")), "warning"))
+        # ---------- ① 状态条 ----------
+        chips: List[dict] = [{
+            "component": "VChip",
+            "props": {"size": "x-small", "variant": "tonal", "color": "primary"},
+            "text": f"v{self.plugin_version}",
+        }]
+        if not problems:
+            chips.append({
+                "component": "VChip",
+                "props": {"size": "x-small", "variant": "tonal", "color": "success"},
+                "text": "配置正常",
+            })
+        chips.append({
+            "component": "VChip",
+            "props": {"size": "x-small", "variant": "tonal",
+                      "color": "success" if self._use_transfer_history else "warning"},
+            "text": "转移历史匹配" if self._use_transfer_history else "启发式匹配",
+        })
+        chips.append({
+            "component": "VChip",
+            "props": {"size": "x-small", "variant": "tonal", "color": "teal"},
+            "text": f"补扫 {self._backfill_cron or '30 4 * * *'}",
+        })
 
-        cols = 12 // len(tiles)
+        header = {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-3"},
+            "content": [{
+                "component": "div",
+                "props": {"class": "d-flex flex-wrap align-center ga-2 px-4 py-3"},
+                "content": [{
+                    "component": "VChip",
+                    "props": {"size": "small", "variant": "flat",
+                              "color": "success" if enabled else "error",
+                              "class": "font-weight-bold"},
+                    "text": "运行中" if enabled else "已停用",
+                }] + chips,
+            }],
+        }
+
+        # ---------- ② 统计磁贴 ----------
         tile_row = {
             "component": "VRow",
+            "props": {"class": "mb-3"},
             "content": [
-                {
-                    "component": "VCol",
-                    "props": {"cols": 12, "sm": 6, "md": cols},
-                    "content": [{
-                        "component": "VAlert",
-                        "props": {"variant": "tonal", "type": "info",
-                                  "color": color, "title": value, "text": label},
-                    }],
-                }
-                for label, value, color in tiles
+                self._stat_card("媒体库 strm", str(strm_count), "primary",
+                                "最终媒体库" if strm_count else "未找到"),
+                self._stat_card("下载目录字幕",
+                                f"{sub_count}+" if sub_capped else str(sub_count),
+                                "teal",
+                                "待同步" if sub_count else "没有待处理"),
+                self._stat_card("上次补扫成功",
+                                str(last.get("ok", "—")) if has_last else "—",
+                                "success" if has_last else "grey",
+                                last.get("time") or "还没跑过"),
+                self._stat_card("上次未匹配",
+                                str(last.get("missed", "—")) if has_last else "—",
+                                "warning" if last.get("missed") else "grey",
+                                "对不上的字幕" if has_last else "—"),
             ],
         }
 
-        blocks: List[dict] = [
-            # ---- 状态：正常时只有一行，不铺陈说明 ----
-            {
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "success" if self._enabled else "warning",
-                    "title": f"运行中 · v{self.plugin_version}" if self._enabled
-                             else "插件未启用",
-                },
-            },
-            tile_row,
-        ]
+        blocks: List[dict] = [header, tile_row]
 
-        # ---- 配置自检：正常就一句话，出问题才展开 ----
+        # ---------- ③ 配置自检：正常已收进状态条，有问题才展开 ----------
         if problems:
-            blocks.append({
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "error",
-                    "title": f"配置有 {len(problems)} 处问题",
-                    "text": " · ".join(problems),
-                },
-            })
-        else:
-            blocks.append({
-                "component": "VAlert",
-                "props": {"variant": "tonal", "type": "success",
-                          "title": "配置正常",
-                          "text": "四个路径均已生效"},
-            })
+            rows = [{"component": "VChip",
+                     "props": {"size": "x-small", "variant": "tonal", "color": "error"},
+                     "text": p}
+                    for p in problems]
+            rows.insert(0, {"component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis mb-2"},
+                            "text": f"共 {len(problems)} 处需要处理"})
+            blocks.append(self._panel("配置自检", rows))
 
-        # ---- 补扫结果：跑过才显示 ----
+        # ---------- ④ 运行信息 ----------
+        alias_lines = [ln for ln in self._alias.splitlines()
+                       if ln.strip() and not ln.strip().startswith("#")]
+        blocks.append(self._panel("运行信息", [
+            self._info_row("下载目录", " · ".join(str(d) for d in src) or "未配置"),
+            self._info_row("媒体库目录", " · ".join(str(d) for d in lib) or "未配置"),
+            self._info_row("匹配方式",
+                           "转移历史 → 启发式 → 别名" if self._use_transfer_history
+                           else "启发式 → 别名"),
+            self._info_row("别名映射",
+                           f"{len(alias_lines)} 条" if alias_lines else "未使用（零配置）",
+                           muted=not alias_lines),
+        ]))
+
+        # ---------- ⑤ 上次补扫：跑过才有 ----------
         if has_last:
-            blocks.append({
-                "component": "VAlert",
-                "props": {
-                    "variant": "tonal",
-                    "type": "warning" if last.get("missed") else "info",
-                    "title": f"上次补扫 · {last.get('time')}",
-                    "text": last.get("msg") or "",
-                },
-            })
+            blocks.append(self._panel(f"上次补扫 · {last.get('time')}", [
+                self._info_row("结果", last.get("msg") or "—"),
+                self._info_row("明细",
+                               f"耗时 {last.get('cost', '—')}s · 媒体库 {last.get('strm', '—')} 个 strm / "
+                               f"{last.get('entries', '—')} 个条目 · 扫描字幕 {last.get('subs', '—')} 条 · "
+                               f"成功 {last.get('ok', '—')} · 跳过 {last.get('skip', '—')} · "
+                               f"失败 {last.get('fail', '—')} · 未匹配 {last.get('missed', '—')}"),
+            ]))
 
         return blocks
 
