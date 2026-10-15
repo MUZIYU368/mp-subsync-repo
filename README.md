@@ -37,13 +37,35 @@ mp-subsync-repo/
 │   └── subsync/
 │       ├── __init__.py
 │       └── README.md
-├── tests/v3/                # 离线验证脚本
+├── tests/v3/                # 离线验证脚本（可脱离 MoviePilot 运行）
 │   └── subsync/
+│       ├── run_all.py           # 一键跑完全部验证
+│       ├── harness.py           # 共用脚手架：装载插件 + 造目录树
+│       ├── stub_host.py         # MoviePilot 宿主桩（apscheduler / app.*）
+│       ├── verify_end_to_end.py # 核心功能端到端测试
 │       └── verify_delete_source.py
 ├── icons/                   # 插件图标
 │   └── subtitle.png
 └── LICENSE
 ```
+
+## 跑测试
+
+```bash
+python3 tests/v3/subsync/run_all.py
+```
+
+插件在 import 期依赖 `apscheduler` 与 `app.*`（MoviePilot 本体），
+因此测试通过 `stub_host.py` 打桩后离线运行，不需要起 MP 容器。
+
+**写新测试时注意两个坑**（都已踩过）：
+
+1. **别用 `tempfile` 建目录**。系统临时目录叫 `tmp`，正好命中插件
+   `STAGING_DIRS` 里的 `'tmp'`，`is_staging()` 会把挂在它下面的 strm
+   全部当成 115 中转目录丢掉 —— 表现为「插件完全不工作」，
+   很容易误判成插件有 bug。用 `harness.Tree`（建在 `tests/v3/subsync/.subsync_test_tmp/`）。
+2. **先 `import stub_host; stub_host.install()`**，
+   否则插件在第一行 import 就崩，什么都测不到。
 
 ## 维护约定
 
