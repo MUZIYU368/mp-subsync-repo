@@ -6,17 +6,15 @@ SubSync —— 外挂字幕同步
 
 设计要点
 --------
-- 事件驱动：只处理本次整理涉及的媒体库目标目录，不对媒体库做全盘扫描，
-  比定时轮询快得多，也不会误伤无关文件。
-- 字幕来源是**配置里的下载目录**，不是媒体库的父目录。下载目录与媒体库
-  是两棵独立的目录树（如 /media/downloads/电视剧 与 /media/电视剧），
-  早期版本误把扫描根设成 target_diritem 的父级，导致永远匹配不到字幕。
-- 下载目录扫描带时间窗口，只处理近期落地的字幕，避免每次整理都全量遍历。
-- 匹配算法沿用 cron 版 sync_subs_to_strm.py 的 v3 策略：
-  先按剧名/电影名建立候选，再匹配集号或年份；中文名用双向最长公共
-  子串，英文名用整词命中；别名配置把英文资源名映射到中文库目录。
-- 强匹配才动手：没有明确证据就整条放弃，不做猜测。
-- 幂等：目标已存在且未开启覆盖时跳过，重复整理不会反复复制。
+- 双通道：
+  1) 事件驱动——整理完成立即处理，延迟最低；
+  2) 定时全库补扫——兜底。事件时机不理想、字幕晚到、容器重建等情况都能补齐。
+- 落点永远是 strm 所在目录（strm.parent），不做分类推断，
+  因此字幕与媒体文件必然同目录、同名主体，仅多一个语言标签。
+- 媒体库索引只认「剧名 (年份)」结构的目录，因此 115 中转目录
+  （平铺 strm，无该结构）会被自然跳过，不会把字幕错放到中间目录。
+- 强匹配才动手：没有明确证据（中文 2 字以上 / 英文整词 / 别名）就整条放弃。
+- 幂等：目标已存在且未开启覆盖时跳过，重复扫描不会反复复制。
 """
 from __future__ import annotations
 
@@ -27,6 +25,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from apscheduler.triggers.cron import CronTrigger
 
 from app.core.event import Event, eventmanager
 from app.log import logger
@@ -68,10 +68,11 @@ RE_YEAR = re.compile(r"[\.\s\(\[](19\d{2}|20\d{2})[\.\s\)\]]")
 RE_LIB_DIR = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)\s*$")
 RE_SEASON_DIR = re.compile(r"^(?:Season|S)\s*\d+", re.I)
 
+# 分类目录名：向上查找标题线索时跳过，避免「电影」「欧美剧」这类目录名参与打分
 CATEGORY_DIRS = {
     "外语电影", "华语电影", "动画电影", "电视剧", "欧美剧", "国产剧",
     "日韩剧", "日番", "国漫", "儿童", "纪录片", "综艺",
-    "电影", "downloads", "media",
+    "电影", "downloads", "media", "Media", "MEDIA",
 }
 
 
@@ -148,8 +149,8 @@ def collect_subtitles(root: Path, chinese_only: bool = True,
                       since: Optional[float] = None) -> List[SubtitleFile]:
     """递归收集指定目录下的字幕文件。
 
-    since 给定时，只保留 mtime 不早于该时刻的文件。下载目录会不断堆积，
-    每次整理都全量遍历既慢又没必要——刚下载完的字幕 mtime 一定是新的。
+    since 给定时，只保留 mtime 不早于该时刻的文件。事件通道用它避免每次整理
+    都全量遍历下载目录；全库补扫不传 since，以便处理历史积压。
     """
     out: List[SubtitleFile] = []
     if not root.exists() or not root.is_dir():
@@ -321,6 +322,17 @@ def score_candidate(title: str, stem: str, ancestor_keys: List[str],
     return score, max_lcs, strong
 
 
+def library_owner(strm: Path) -> Optional[Path]:
+    """返回 strm 所属的「剧名 (年份)」目录；不符合结构则返回 None。
+
+    这是区分「真正的媒体库」与「115 中转目录 / 下载目录」的关键：
+    中转目录里的 strm 是平铺的，取不到「剧名 (年份)」这一层，直接判否。
+    """
+    d = strm.parent
+    lib = d.parent if RE_SEASON_DIR.match(d.name) else d
+    return lib if RE_LIB_DIR.match(lib.name) else None
+
+
 def build_movie_entries(strm_files: List[Path]) -> List[MovieEntry]:
     """按目标目录中的 strm 列表构建电影候选条目。"""
     groups: Dict[Path, MovieEntry] = {}
@@ -373,6 +385,7 @@ def plan_for_subtitle(sub: SubtitleFile, movie_entries: List[MovieEntry],
         season, episode = season_ep
         candidates: List[Tuple[int, int, int, TvEntry]] = []
         for tv in tv_entries:
+            # 季/集先做字典命中过滤，避免全库逐条打分
             if season not in tv.seasons or episode not in tv.seasons[season]:
                 continue
             score, max_lcs, strong = score_candidate(
@@ -394,6 +407,9 @@ def plan_for_subtitle(sub: SubtitleFile, movie_entries: List[MovieEntry],
 
     candidates = []
     for mv in movie_entries:
+        # 年份两侧都已知且不一致时不可能是同一部片，直接跳过（全库扫描的性能关键）
+        if year and mv.year and mv.year != year:
+            continue
         score, max_lcs, strong = score_candidate(
             mv.title, stem, ancestor_keys, alias_hits, stem_key)
         if not strong:
@@ -449,25 +465,16 @@ def apply_plans(plans: List[Plan], overwrite: bool,
 
 
 class SubSync(_PluginBase):
-    """外挂字幕同步：整理完成后把下载目录的字幕按 strm 同名复制到媒体库。"""
+    """外挂字幕同步：把下载目录的字幕按 strm 同名复制到媒体库。"""
 
-    # 插件名称
     plugin_name = "外挂字幕同步"
-    # 插件描述
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
-    # 插件图标
     plugin_icon = "subtitle.png"
-    # 插件版本
-    plugin_version = "1.2.0"
-    # 插件作者
+    plugin_version = "1.3.0"
     plugin_author = "MUZIYU368"
-    # 插件标签
     plugin_label = "字幕"
-    # 插件配置项ID前缀
     plugin_config_prefix = "subsync_"
-    # 加载顺序
     plugin_order = 50
-    # 可使用的用户级别
     auth_level = 1
 
     _enabled = False
@@ -477,6 +484,9 @@ class SubSync(_PluginBase):
     _recent_window = 86400.0
     _download_movie = ""
     _download_tv = ""
+    _library_movie = ""
+    _library_tv = ""
+    _backfill_cron = ""
     _alias = ""
 
     def init_plugin(self, config: dict = None) -> None:
@@ -489,6 +499,9 @@ class SubSync(_PluginBase):
         self._recent_window = 86400.0
         self._download_movie = ""
         self._download_tv = ""
+        self._library_movie = ""
+        self._library_tv = ""
+        self._backfill_cron = ""
         self._alias = ""
         if not config:
             return
@@ -504,6 +517,9 @@ class SubSync(_PluginBase):
         self._recent_window = max(days, 0.1) * 86400
         self._download_movie = str(config.get("download_movie") or "")
         self._download_tv = str(config.get("download_tv") or "")
+        self._library_movie = str(config.get("library_movie") or "")
+        self._library_tv = str(config.get("library_tv") or "")
+        self._backfill_cron = str(config.get("backfill_cron") or "")
         self._alias = str(config.get("alias") or "")
 
     def get_state(self) -> bool:
@@ -512,12 +528,40 @@ class SubSync(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """返回插件远程命令列表。"""
-        return []
+        """注册远程命令，可直接在 MP 对话框输入 /subsync_scan_all 触发。"""
+        return [
+            {
+                "cmd": "/subsync_scan_all",
+                "event": EventType.PluginAction,
+                "desc": "立即全库补扫字幕",
+                "category": "字幕",
+                "data": {"action": "subsync_scan_all"},
+            }
+        ]
 
     def get_api(self) -> List[Dict[str, Any]]:
         """返回插件 API 列表。"""
         return []
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """注册定时全库补扫服务，作为事件通道的兜底。"""
+        if not self.get_state():
+            return []
+        cron = (self._backfill_cron or "").strip() or "30 4 * * *"
+        try:
+            trigger = CronTrigger.from_crontab(cron)
+        except (ValueError, TypeError):
+            logger.warning(f"[字幕同步] 补扫 cron 表达式无效: {cron}，回退到默认 30 4 * * *")
+            trigger = CronTrigger.from_crontab("30 4 * * *")
+        return [
+            {
+                "id": "SubSync.Backfill",
+                "name": "外挂字幕同步 · 全库补扫",
+                "trigger": trigger,
+                "func": self._run_backfill,
+                "kwargs": {},
+            }
+        ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
         """返回插件配置表单与默认配置。"""
@@ -527,52 +571,70 @@ class SubSync(_PluginBase):
                 "content": [
                     {
                         "component": "VSwitch",
-                        "props": {"model": "enabled", "label": "启用插件"}
+                        "props": {"model": "enabled", "label": "启用插件"},
                     },
                     {
                         "component": "VSwitch",
-                        "props": {
-                            "model": "chinese_only",
-                            "label": "仅同步中文字幕"
-                        }
+                        "props": {"model": "chinese_only", "label": "仅同步中文字幕"},
                     },
                     {
                         "component": "VSwitch",
-                        "props": {
-                            "model": "overwrite",
-                            "label": "覆盖已存在的目标字幕"
-                        }
+                        "props": {"model": "overwrite", "label": "覆盖已存在的目标字幕"},
                     },
                     {
                         "component": "VSwitch",
                         "props": {
                             "model": "delete_source",
-                            "label": "复制成功后删除下载目录的源字幕（释放空间）"
-                        }
+                            "label": "复制成功后删除下载目录的源字幕（释放空间）",
+                        },
                     },
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "download_movie",
                             "label": "下载目录（电影）",
-                            "placeholder": "/media/downloads/电影"
-                        }
+                            "placeholder": "/media/downloads/电影",
+                        },
                     },
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "download_tv",
                             "label": "下载目录（剧集）",
-                            "placeholder": "/media/downloads/电视剧"
-                        }
+                            "placeholder": "/media/downloads/电视剧",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "library_movie",
+                            "label": "媒体库目录（电影）",
+                            "placeholder": "/media/电影",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "library_tv",
+                            "label": "媒体库目录（剧集）",
+                            "placeholder": "/media/电视剧",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "backfill_cron",
+                            "label": "全库补扫定时（crontab 格式，留空则每天 04:30）",
+                            "placeholder": "30 4 * * *",
+                        },
                     },
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "recent_window_days",
-                            "label": "下载目录扫描时间窗口（天）",
-                            "placeholder": "1"
-                        }
+                            "label": "事件通道的下载目录扫描时间窗口（天）",
+                            "placeholder": "1",
+                        },
                     },
                     {
                         "component": "VTextarea",
@@ -580,8 +642,17 @@ class SubSync(_PluginBase):
                             "model": "alias",
                             "label": "别名映射（每行：英文别名|中文剧名A|中文剧名B）",
                             "placeholder": "from|梦魇绝镇|迷离小镇",
-                            "rows": 4
-                        }
+                            "rows": 4,
+                        },
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "text": "字幕一定落在对应 strm 所在的目录，不需要在这里填分类规则。"
+                                    "媒体库只需配置到分类根目录（如 /media/电影），插件会自动向下"
+                                    "识别「剧名 (年份)」结构；115 中转目录因为没有这个结构会被自动跳过。",
+                        },
                     },
                     {
                         "component": "VAlert",
@@ -589,20 +660,19 @@ class SubSync(_PluginBase):
                             "type": "warning",
                             "text": "「复制成功后删除源字幕」默认关闭。开启后字幕会被移动到媒体库，"
                                     "下载目录中的原文件不再保留，且无法自动恢复。"
-                                    "仅在确认字幕已正确入库后再开启。"
-                        }
+                                    "仅在确认字幕已正确入库后再开启。",
+                        },
                     },
                     {
                         "component": "VAlert",
                         "props": {
                             "type": "info",
-                            "text": "字幕来源是你上面配置的下载目录，媒体库侧只按本次整理的目标目录"
-                                    "建立索引。下载目录与媒体库是两棵独立的目录树，"
-                                    "两者都必须填写正确，否则匹配不到。"
-                                    "扫描时间窗口用于跳过老字幕，只处理近期新增的。"
-                        }
-                    }
-                ]
+                            "text": "所有路径都按 MoviePilot 容器内看到的路径填写。"
+                                    "若宿主机是 /volume1/Media 而容器内挂载为 /media，"
+                                    "这里应填 /media/... 。可执行 ls 确认。",
+                        },
+                    },
+                ],
             }
         ], {
             "enabled": True,
@@ -611,41 +681,30 @@ class SubSync(_PluginBase):
             "delete_source": False,
             "download_movie": "/media/downloads/电影",
             "download_tv": "/media/downloads/电视剧",
+            "library_movie": "/media/电影",
+            "library_tv": "/media/电视剧",
+            "backfill_cron": "30 4 * * *",
             "recent_window_days": 1,
-            "alias": ""
+            "alias": "",
         }
 
     def stop_service(self) -> None:
-        """停止插件后台服务并释放资源。"""
+        """停止插件后台服务并释放资源（调度器由宿主在禁用时清理）。"""
         return None
 
     def get_page(self) -> Optional[List[dict]]:
         """返回插件详情页面；本插件不提供独立页面。"""
         return None
 
-    def _dump_event(self, data: Dict[str, Any], transfer: Dict[str, Any]) -> None:
-        """把 TransferComplete 事件的真实结构打进日志，供开发确认字段名。"""
-        logger.info(f"[字幕同步][调试] event_data 顶层字段: {sorted(data.keys())}")
-        logger.info(f"[字幕同步][调试] transferinfo 完整内容: {transfer}")
-        for k, v in transfer.items():
-            if isinstance(v, dict):
-                logger.info(f"[字幕同步][调试]   {k} -> dict, 子字段: {sorted(v.keys())}")
-            elif isinstance(v, (list, tuple)):
-                if v and isinstance(v[0], dict):
-                    logger.info(
-                        f"[字幕同步][调试]   {k} -> list[dict], 首元素子字段: {sorted(v[0].keys())}")
-                else:
-                    logger.info(f"[字幕同步][调试]   {k} -> {v!r}")
-            else:
-                logger.info(f"[字幕同步][调试]   {k} = {v!r}")
+    # ---------- 路径工具 ----------
 
-    def _source_dirs(self) -> List[Path]:
-        """返回配置中有效（存在）的下载目录列表。"""
+    def _valid_dirs(self, raws: Tuple[str, ...]) -> List[Path]:
+        """把配置里的路径字符串解析为存在且去重后的目录列表。"""
         dirs: List[Path] = []
-        for raw in (self._download_movie, self._download_tv):
-            p = Path(raw).strip() if raw else None
-            if not p:
+        for raw in raws:
+            if not raw:
                 continue
+            p = Path(raw.strip())
             try:
                 if p.exists() and p.is_dir() and p not in dirs:
                     dirs.append(p)
@@ -653,8 +712,17 @@ class SubSync(_PluginBase):
                 continue
         return dirs
 
-    def _allowed_source(self, path: Path, roots: List[Path]) -> bool:
-        """判断字幕路径是否位于给定目录内。roots 为空时不做限制。"""
+    def _source_dirs(self) -> List[Path]:
+        """下载目录：字幕的来源。"""
+        return self._valid_dirs((self._download_movie, self._download_tv))
+
+    def _library_dirs(self) -> List[Path]:
+        """媒体库目录：strm 的所在范围。"""
+        return self._valid_dirs((self._library_movie, self._library_tv))
+
+    @staticmethod
+    def _allowed_source(path: Path, roots: List[Path]) -> bool:
+        """判断路径是否位于给定目录内。roots 为空时不做限制。"""
         if not roots:
             return True
         for root in roots:
@@ -665,64 +733,25 @@ class SubSync(_PluginBase):
                 continue
         return False
 
-    @eventmanager.register(EventType.TransferComplete)
-    def on_transfer_complete(self, event: Event) -> None:
-        """整理完成后，把下载目录的外挂字幕按 strm 同名复制到媒体库。"""
-        if not self._enabled:
-            return
-        data = event.event_data or {}
-        transfer = data.get("transferinfo")
-        if not transfer:
-            return
+    def _collect_library_index(self) -> Tuple[List[MovieEntry], List[TvEntry], int]:
+        """扫描媒体库建立全量索引，只收录位于「剧名 (年份)」目录下的 strm。"""
+        strms: List[Path] = []
+        for root in self._library_dirs():
+            try:
+                for p in root.rglob("*.strm"):
+                    if library_owner(p) is not None:
+                        strms.append(p)
+            except OSError as exc:
+                logger.warning(f"[字幕同步] 扫描媒体库失败 {root}: {exc}")
+        return build_movie_entries(strms), build_tv_entries(strms), len(strms)
 
-        # v1.2.0 临时调试输出：确认 transferinfo 的真实结构，
-        # 以便下一版直接复用 MP 整理时的改名结果，实现零猜测自动匹配。
-        # 拿到结构后本段会在 1.3.0 移除。
-        self._dump_event(data, transfer)
+    # ---------- 两条处理通道 ----------
 
-        target = transfer.get("target_diritem")
-        if not target or not target.get("path"):
-            return
-        target_root = Path(target["path"])
-        try:
-            if not target_root.exists():
-                return
-        except OSError:
-            return
-
-        # 媒体库侧：只用本次整理的目标目录建立索引，不做全盘扫描
-        try:
-            strm_files = sorted(target_root.rglob("*.strm"))
-        except OSError as exc:
-            logger.warning(f"[字幕同步] 扫描目标目录失败 {target_root}: {exc}")
-            return
-        if not strm_files:
-            logger.debug(f"[字幕同步] {target_root} 下暂无 strm，本次跳过")
-            return
-
-        # 下载目录侧：字幕来源。这里必须是配置的下载目录，
-        # 不能用 target_root.parent —— 那是媒体库的分类父目录，与下载目录不相交。
-        source_dirs = self._source_dirs()
-        if not source_dirs:
-            logger.warning("[字幕同步] 未找到有效的下载目录，请在插件设置里检查路径")
-            return
-
-        since = time.time() - self._recent_window
-        subs: List[SubtitleFile] = []
-        for d in source_dirs:
-            subs.extend(collect_subtitles(d, self._chinese_only, since))
-        if not subs:
-            logger.debug(
-                f"[字幕同步] 下载目录近 {self._recent_window / 86400:.1f} 天内没有新增字幕")
-            return
-
+    def _match_and_apply(self, subs: List[SubtitleFile],
+                         movie_entries: List[MovieEntry], tv_entries: List[TvEntry],
+                         source_dirs: List[Path]) -> Tuple[int, int, int, int]:
+        """对字幕做匹配与复制，返回 (成功, 跳过, 失败, 未匹配)。"""
         alias_map = load_alias_text(self._alias)
-        movie_entries = build_movie_entries(strm_files)
-        tv_entries = build_tv_entries(strm_files)
-        if not movie_entries and not tv_entries:
-            logger.debug("[字幕同步] 目标目录里没有可识别的剧名 (年份) 结构，跳过")
-            return
-
         plans: List[Plan] = []
         missed = 0
         for sub in subs:
@@ -739,14 +768,110 @@ class SubSync(_PluginBase):
             else:
                 missed += 1
                 logger.debug(f"[字幕同步] 未匹配到目标，跳过: {sub.path.name}")
-
-        if missed:
-            logger.info(
-                f"[字幕同步] 共扫描 {len(subs)} 条字幕，{missed} 条未匹配"
-                f"（可调低时间窗口、放宽别名配置，或调高 MoviePilot 日志级别查看明细）")
         if not plans:
+            return 0, 0, 0, missed
+        ok, skip, fail = apply_plans(plans, self._overwrite, self._delete_source)
+        return ok, skip, fail, missed
+
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event) -> None:
+        """通道一：整理完成时，只处理本次整理涉及的目标目录。"""
+        if not self._enabled:
+            return
+        data = event.event_data or {}
+        transfer = data.get("transferinfo")
+        if not transfer:
             return
 
-        ok, skip, fail = apply_plans(plans, self._overwrite, self._delete_source)
+        target = transfer.get("target_diritem")
+        if not target or not target.get("path"):
+            return
+        target_root = Path(target["path"])
+        try:
+            if not target_root.exists():
+                return
+        except OSError:
+            return
+
+        try:
+            strm_files = sorted(target_root.rglob("*.strm"))
+        except OSError as exc:
+            logger.warning(f"[字幕同步] 扫描目标目录失败 {target_root}: {exc}")
+            return
+        # 只认「剧名 (年份)」结构；115 中转目录等平铺 strm 会在这里被跳过
+        strm_files = [s for s in strm_files if library_owner(s) is not None]
+        if not strm_files:
+            logger.debug(f"[字幕同步] {target_root} 下没有媒体库结构的 strm，本次跳过")
+            return
+
+        source_dirs = self._source_dirs()
+        if not source_dirs:
+            logger.warning("[字幕同步] 未找到有效的下载目录，请在插件设置里检查路径")
+            return
+
+        since = time.time() - self._recent_window
+        subs: List[SubtitleFile] = []
+        for d in source_dirs:
+            subs.extend(collect_subtitles(d, self._chinese_only, since))
+        if not subs:
+            logger.debug(
+                f"[字幕同步] 下载目录近 {self._recent_window / 86400:.1f} 天内没有新增字幕")
+            return
+
+        movie_entries = build_movie_entries(strm_files)
+        tv_entries = build_tv_entries(strm_files)
+        ok, skip, fail, missed = self._match_and_apply(subs, movie_entries, tv_entries, source_dirs)
+        if missed:
+            logger.info(f"[字幕同步] 共扫描 {len(subs)} 条字幕，{missed} 条未匹配")
         if ok or fail:
             logger.info(f"[字幕同步] 完成：成功 {ok}，跳过 {skip}，失败 {fail}")
+
+    def scan_library(self) -> str:
+        """通道二：全库补扫，把下载目录里所有字幕与整个媒体库索引匹配，补齐缺失项。"""
+        source_dirs = self._source_dirs()
+        if not source_dirs:
+            return "全库补扫失败：未找到有效的下载目录，请检查插件设置里的两个下载目录"
+        if not self._library_dirs():
+            return "全库补扫失败：未找到有效的媒体库目录，请检查插件设置里的两个媒体库目录"
+
+        movie_entries, tv_entries, strm_count = self._collect_library_index()
+        if not movie_entries and not tv_entries:
+            return "全库补扫失败：媒体库里没有识别到「剧名 (年份)」结构的条目"
+
+        subs: List[SubtitleFile] = []
+        for d in source_dirs:
+            # 补扫不设时间窗口，历史积压一并处理
+            subs.extend(collect_subtitles(d, self._chinese_only))
+        if not subs:
+            return f"全库补扫：媒体库索引 {strm_count} 个 strm，下载目录里没有字幕文件"
+
+        t0 = time.time()
+        ok, skip, fail, missed = self._match_and_apply(subs, movie_entries, tv_entries, source_dirs)
+        cost = time.time() - t0
+        msg = (f"全库补扫完成（{cost:.1f}s）：媒体库 {strm_count} 个 strm / "
+               f"{len(movie_entries) + len(tv_entries)} 个条目，扫描字幕 {len(subs)} 条 → "
+               f"成功 {ok}，已存在跳过 {skip}，失败 {fail}，未匹配 {missed}")
+        logger.info(f"[字幕同步] {msg}")
+        return msg
+
+    @eventmanager.register(EventType.PluginAction)
+    def on_plugin_action(self, event: Event) -> None:
+        """处理远程命令 /subsync_scan_all。"""
+        data = event.event_data or {}
+        if data.get("action") != "subsync_scan_all":
+            return
+        if not self._enabled:
+            self.post_message("[字幕同步] 插件未启用，无法执行全库补扫")
+            return
+        try:
+            self.post_message(self.scan_library())
+        except Exception as exc:
+            logger.error(f"[字幕同步] 全库补扫异常: {exc}")
+            self.post_message(f"全库补扫异常: {exc}")
+
+    def _run_backfill(self) -> None:
+        """定时服务入口。"""
+        try:
+            self.scan_library()
+        except Exception as exc:
+            logger.error(f"[字幕同步] 定时全库补扫异常: {exc}")
