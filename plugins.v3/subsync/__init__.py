@@ -470,7 +470,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -692,9 +692,168 @@ class SubSync(_PluginBase):
         """停止插件后台服务并释放资源（调度器由宿主在禁用时清理）。"""
         return None
 
+    @staticmethod
+    def _count_files(roots: List[Path], suffixes: Set[str],
+                     cap: int = 20000) -> Tuple[int, bool]:
+        """统计目录下指定后缀的文件数，达到上限提前停止。返回 (数量, 是否被截断)。"""
+        total = 0
+        capped = False
+        for r in roots or []:
+            try:
+                for p in r.rglob("*"):
+                    # 先比后缀再 stat，避免对海量文件做无谓的系统调用
+                    if p.suffix.lower() not in suffixes:
+                        continue
+                    try:
+                        if p.is_file():
+                            total += 1
+                    except OSError:
+                        continue
+                    if total >= cap:
+                        capped = True
+                        break
+            except OSError:
+                continue
+            if capped:
+                break
+        return total, capped
+
+    def _path_lines(self) -> str:
+        """把四个关键路径的可读状态拼成一段文字。"""
+        def fmt(raw: str, root: str) -> str:
+            if not raw:
+                return f"{root}：未填写"
+            try:
+                p = Path(raw.strip())
+            except (OSError, ValueError):
+                return f"{root}：{raw}（路径非法）"
+            if not p.exists():
+                return f"{root}：{raw}（不存在）"
+            if not p.is_dir():
+                return f"{root}：{raw}（不是目录）"
+            return f"{root}：{raw} ✓"
+
+        return "\n".join([
+            fmt(self._download_tv, "下载目录·剧集"),
+            fmt(self._download_movie, "下载目录·电影"),
+            fmt(self._library_tv, "媒体库·剧集"),
+            fmt(self._library_movie, "媒体库·电影"),
+        ])
+
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页面；本插件不提供独立页面。"""
-        return None
+        """插件详情页：运行状态、配置自检、库内统计与最近一次补扫结果。"""
+        src = self._source_dirs()
+        lib = self._library_dirs()
+        try:
+            last = self.get_data("last_scan") or {}
+        except Exception:
+            last = {}
+
+        strm_count, _ = self._count_files(lib, {".strm"})
+        sub_count, sub_capped = self._count_files(src, SUB_EXTS)
+        ready = bool(src) and bool(lib)
+
+        def tile(label: str, value: str, color: str) -> dict:
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "sm": 6, "md": 3},
+                "content": [{
+                    "component": "VAlert",
+                    "props": {
+                        "variant": "tonal",
+                        "type": "info",
+                        "color": color,
+                        "title": value,
+                        "text": label,
+                    },
+                }],
+            }
+
+        last_time = last.get("time") or "尚未执行"
+        last_msg = last.get("msg") or "还没有跑过全库补扫。发 /subsync_scan_all 可以立刻执行一次。"
+
+        return [
+            # ---- 运行状态 ----
+            {
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "success" if self._enabled else "warning",
+                    "title": f"插件已启用 · v{self.plugin_version}" if self._enabled
+                             else "插件未启用",
+                    "text": "字幕会落在对应 strm 所在的目录，与媒体文件同目录、"
+                            "同名主体，仅多一个语言标签（如 .zh-Hans / .en）。"
+                            "不做分类推断，因此 115 中转目录不会被误写入。",
+                },
+            },
+            # ---- 统计磁贴 ----
+            {
+                "component": "VRow",
+                "content": [
+                    tile("媒体库 strm 数", str(strm_count), "primary"),
+                    tile(f"下载目录字幕数{'（已截断统计）' if sub_capped else ''}",
+                         str(sub_count), "secondary"),
+                    tile("上次补扫成功", str(last.get("ok", "—")), "success"),
+                    tile("上次补扫未匹配", str(last.get("missed", "—")), "warning"),
+                ],
+            },
+            # ---- 配置自检 ----
+            {
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "success" if ready else "error",
+                    "title": "配置自检：已就绪" if ready else "配置不完整，插件不会工作",
+                    "text": self._path_lines(),
+                },
+            },
+            # ---- 最近一次补扫 ----
+            {
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "info",
+                    "title": f"最近一次全库补扫 · {last_time}",
+                    "text": last_msg,
+                },
+            },
+            # ---- 怎么触发 ----
+            {
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "info",
+                    "title": "怎么触发补扫",
+                    "text": f"① 在 MoviePilot 对话框发送 /subsync_scan_all 立刻执行一次；"
+                            f"② 等待每天 {self._backfill_cron or '04:30'} 自动补扫（可在设置里改）。"
+                            f"整理完成时的事件通道会自动处理刚下载的那一集，无需等待定时任务。",
+                },
+            },
+            # ---- 匹配规则说明 ----
+            {
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "info",
+                    "title": "什么时候能匹配上",
+                    "text": "• 中文剧名 + 正确的季集号 → 直接命中\n"
+                            "• 英文资源名（如 From） → 需要在「别名映射」里写一行 from|梦魇绝镇\n"
+                            "• 名字对不上时不猜、不乱配，宁可跳过；可在设置里把别名映射当映射表维护",
+                },
+            },
+            # ---- 常见问题 ----
+            {
+                "component": "VAlert",
+                "props": {
+                    "variant": "tonal",
+                    "type": "warning",
+                    "title": "三个容易踩的坑",
+                    "text": "① 所有路径按容器内看到的填，不是宿主机路径\n"
+                            "② 插件市场里要点「同步插件源」，「刷新」只重画本地缓存\n"
+                            "③ 改代码后必须同步改三处版本号，否则 MP 认为没有新版本",
+                },
+            },
+        ]
 
     # ---------- 路径工具 ----------
 
@@ -852,6 +1011,13 @@ class SubSync(_PluginBase):
                f"{len(movie_entries) + len(tv_entries)} 个条目，扫描字幕 {len(subs)} 条 → "
                f"成功 {ok}，已存在跳过 {skip}，失败 {fail}，未匹配 {missed}")
         logger.info(f"[字幕同步] {msg}")
+        self._save_scan_stat(
+            time=time.strftime("%Y-%m-%d %H:%M:%S"),
+            cost=round(cost, 1), strm=strm_count,
+            entries=len(movie_entries) + len(tv_entries),
+            subs=len(subs), ok=ok, skip=skip, fail=fail, missed=missed,
+            msg=msg,
+        )
         return msg
 
     @eventmanager.register(EventType.PluginAction)
@@ -861,17 +1027,49 @@ class SubSync(_PluginBase):
         if data.get("action") != "subsync_scan_all":
             return
         if not self._enabled:
-            self.post_message("[字幕同步] 插件未启用，无法执行全库补扫")
+            self._notify("插件未启用，无法执行全库补扫", level="warning")
             return
         try:
-            self.post_message(self.scan_library())
+            self._notify(self.scan_library())
         except Exception as exc:
             logger.error(f"[字幕同步] 全库补扫异常: {exc}")
-            self.post_message(f"全库补扫异常: {exc}")
+            self._notify(f"全库补扫异常: {exc}", level="error")
 
     def _run_backfill(self) -> None:
         """定时服务入口。"""
         try:
-            self.scan_library()
+            msg = self.scan_library()
+            # 定时任务不刷屏推送，只在有实际补齐时才提示
+            data = self.get_data("last_scan") or {}
+            if data.get("ok"):
+                self._notify(msg)
         except Exception as exc:
             logger.error(f"[字幕同步] 定时全库补扫异常: {exc}")
+
+    # ---------- 通知与统计持久化 ----------
+
+    def _notify(self, text: str, title: str = "外挂字幕同步",
+                level: str = "success") -> None:
+        """推送系统消息。
+
+        宿主 post_message 的签名在不同版本间有差异（有 keyword-only 与单参两种形态），
+        这里逐个尝试并静默兜底，避免通知失败反过来影响补扫本身。
+        """
+        try:
+            self.post_message(title=title, text=text)
+            return
+        except TypeError:
+            pass
+        except Exception as exc:
+            logger.debug(f"[字幕同步] post_message 关键字调用失败: {exc}")
+        try:
+            self.post_message(text)
+        except Exception as exc:
+            logger.debug(f"[字幕同步] post_message 单参调用失败: {exc}")
+
+    def _save_scan_stat(self, **kw: Any) -> None:
+        """保存最近一次补扫的统计结果，供详情页展示。"""
+        try:
+            self.save_data("last_scan", kw)
+        except Exception as exc:
+            logger.debug(f"[字幕同步] 保存补扫统计失败: {exc}")
