@@ -13,6 +13,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 SUITES = [
+    ("立即补扫按钮", "verify_instant_run.py"),
     ("插件核心功能（端到端）", "verify_end_to_end.py"),
     ("源文件清理开关", "verify_delete_source.py"),
 ]
