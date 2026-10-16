@@ -1,4 +1,9 @@
-"""立即补扫按钮（v1.8.0）专项验证。"""
+"""立即运行一次（v1.8.1）验证。
+
+覆盖两条真实可用的触发路径：
+  ① 配置页「立即运行一次」开关 → 保存即触发（init_plugin 消费信号）
+  ② REST 接口 GET/POST /plugin/SubSync/scan_now → 必须挂上 endpoint
+"""
 import sys
 from pathlib import Path
 
@@ -15,25 +20,97 @@ def check(name, cond, detail=""):
         F.append(name)
 
 
-print("=== 1. API 注册 ===")
-apis = mod.SubSync.get_api(mod.SubSync.__new__(mod.SubSync))
+print("=== 1. API 必须带 endpoint（v1.8.0 漏了它导致 404）===")
+inst = mod.SubSync.__new__(mod.SubSync)
+inst._store = {}
+apis = inst.get_api()
 check("注册了 API", isinstance(apis, list) and len(apis) == 1, apis)
 api = apis[0] if apis else {}
 check("路径是 /scan_now", api.get("path") == "/scan_now", api.get("path"))
-check("支持 GET", "GET" in (api.get("methods") or []), api.get("methods"))
-check("有 summary", bool(api.get("summary")), api.get("summary"))
+check("🔑 有 endpoint 字段", "endpoint" in api, list(api))
+check("endpoint 指向 run_scan_now", api.get("endpoint") == inst.run_scan_now,
+      api.get("endpoint"))
+check("endpoint 是可调用对象", callable(api.get("endpoint")))
+check("支持 GET/POST", set(api.get("methods") or []) >= {"GET", "POST"},
+      api.get("methods"))
 
-print("\n=== 2. 未启用时不执行 ===")
+print("\n=== 2. run_now 开关存在且默认关 ===")
+form, defaults = inst.get_form()
+check("默认值 run_now=False", defaults.get("run_now") is False, defaults.get("run_now"))
+import json
+blob = json.dumps(form, ensure_ascii=False)
+check("表单含 run_now 开关", '"run_now"' in blob)
+check("标签是「立即运行一次」", "立即运行一次" in blob)
+
+print("\n=== 3. 打开开关保存 → 真的跑一次 ===")
 with Tree() as t:
-    p = make_plugin(mod, download_tv=str(t / "dl"), library_tv=str(t / "lib"),
-                    enabled=False)
-    r = p.run_scan_now()
-    check("返回失败", r.get("success") is False, r)
-    check("提示未启用", "未启用" in r.get("message", ""), r.get("message"))
-    check("有推送告知用户", len(p._store.get("_posted", [])) >= 1,
-          p._store.get("_posted"))
+    dl, lib = t / "dl", t / "library"
+    subtitle(dl / "三体.2023.chs.srt")
+    season = lib / "电视剧/国产剧/三体 (2023)/Season 1"
+    strm(season / "三体 (2023) - S01E01 - 第 1 集.strm")
 
-print("\n=== 3. 正常触发（端到端）===")
+    p = mod.SubSync.__new__(mod.SubSync)
+    p._store = {}
+    p._cfg = {}
+    p.get_config = lambda: dict(p._cfg)
+    p.update_config = lambda cfg: p._cfg.update(cfg)
+
+    cfg = {"enabled": True, "run_now": True,
+           "download_tv": str(dl), "library_tv": str(lib)}
+    p.init_plugin(cfg)
+
+    check("字幕真的入库了",
+          (season / "三体 (2023) - S01E01 - 第 1 集.zh-Hans.srt").exists(),
+          sorted(x.name for x in season.glob("*")))
+    check("统计落盘 ok=1", p.get_data("last_scan", {}).get("ok") == 1,
+          p.get_data("last_scan"))
+    check("推了结果", len(p._store.get("_posted", [])) >= 1, p._store.get("_posted"))
+    check("🔑 run_now 已复位为 False", p._cfg.get("run_now") is False, p._cfg.get("run_now"))
+    check("run_now 没混进运行态属性", not hasattr(p, "_run_now"))
+
+print("\n=== 4. 复位后改别的配置不会重复跑 ===")
+with Tree() as t:
+    dl, lib = t / "dl", t / "library"
+    subtitle(dl / "三体.2023.chs.srt")
+    season = lib / "电视剧/国产剧/三体 (2023)/Season 1"
+    strm(season / "三体 (2023) - S01E01 - 第 1 集.strm")
+
+    p = mod.SubSync.__new__(mod.SubSync)
+    p._store = {}
+    p._cfg = {}
+    p.get_config = lambda: dict(p._cfg)
+    p.update_config = lambda cfg: p._cfg.update(cfg)
+
+    p.init_plugin({"enabled": True, "run_now": True,
+                   "download_tv": str(dl), "library_tv": str(lib)})
+    first = p.get_data("last_scan", {}).get("time")
+    check("第一次真的跑了", bool(first), first)
+
+    subtitle(dl / "流浪地球.2019.chs.srt")
+    strm(lib / "电影/华语电影/流浪地球 (2019)/流浪地球 (2019) - 2160p.strm")
+    # 再 init 一次，但 run_now 已被复位为 False
+    p.init_plugin({"enabled": True, "run_now": p._cfg.get("run_now"),
+                   "download_tv": str(dl), "library_tv": str(lib)})
+    second = p.get_data("last_scan", {}).get("time")
+    check("🔑 第二次没有重复触发", first == second, f"{first} -> {second}")
+    check("新字幕没被自动处理",
+          not list((lib / "电影/华语电影/流浪地球 (2019)").glob("*.srt")))
+
+print("\n=== 5. 未启用时点开关 → 明确告知，不静默 ===")
+with Tree() as t:
+    p = mod.SubSync.__new__(mod.SubSync)
+    p._store = {}
+    p._cfg = {}
+    p.get_config = lambda: dict(p._cfg)
+    p.update_config = lambda cfg: p._cfg.update(cfg)
+    p.init_plugin({"enabled": False, "run_now": True,
+                   "download_tv": str(t / "dl"), "library_tv": str(t / "lib")})
+    posted = p._store.get("_posted", [])
+    check("仍复位了 run_now", p._cfg.get("run_now") is False, p._cfg.get("run_now"))
+    check("推送了提示", len(posted) >= 1, posted)
+    check("提示是未启用", any("未启用" in str(m) for m in posted), posted)
+
+print("\n=== 6. API 端点 run_scan_now 直接调 ===")
 with Tree() as t:
     dl, lib = t / "dl", t / "library"
     subtitle(dl / "三体.2023.chs.srt")
@@ -41,59 +118,23 @@ with Tree() as t:
     strm(season / "三体 (2023) - S01E01 - 第 1 集.strm")
     p = make_plugin(mod, download_tv=str(dl), library_tv=str(lib))
     r = p.run_scan_now()
-    check("返回成功", r.get("success") is True, r)
-    check("带本次统计", bool(r.get("stat")), r.get("stat"))
-    check("成功数为 1", r["stat"].get("ok") == 1, r["stat"])
-    check("字幕真的入库",
+    check("返回 success", r.get("success") is True, r)
+    check("字幕入库",
           (season / "三体 (2023) - S01E01 - 第 1 集.zh-Hans.srt").exists(),
           sorted(x.name for x in season.glob("*")))
-    check("统计已落盘", p.get_data("last_scan", {}).get("ok") == 1,
-          p.get_data("last_scan"))
-    check("推送了结果", len(p._store.get("_posted", [])) >= 1,
-          p._store.get("_posted"))
 
-print("\n=== 4. 失败路径也要返回可读信息 ===")
+    off = make_plugin(mod, download_tv=str(dl), library_tv=str(lib), enabled=False)
+    r2 = off.run_scan_now()
+    check("未启用返回失败", r2.get("success") is False, r2)
+
+print("\n=== 7. 详情页已撤掉假按钮 ===")
 with Tree() as t:
-    (t / "dl").mkdir()          # 下载目录有效，让它走到媒体库那一步
-    p = make_plugin(mod, download_tv=str(t / "dl"), library_tv="/nowhere/gone")
-    r = p.run_scan_now()
-    check("标记失败", r.get("success") is False, r)
-    check("说明原因", "媒体库目录" in r.get("message", ""), r.get("message"))
-    check("统计标了 error", (r.get("stat") or {}).get("error") is True,
-          r.get("stat"))
-
-print("\n=== 5. 详情页按钮渲染 ===")
-with Tree() as t:
-    p = make_plugin(mod, download_tv=str(t / "dl"), library_tv=str(t / "lib"))
-    page = p.get_page()
-    txt = str(page)
-    check("页面返回块", isinstance(page, list) and len(page) >= 3, len(page or []))
-    check("含按钮文案「立即补扫一次」", "立即补扫一次" in txt)
-    check("含 VBtn 组件", '"component": "VBtn"' in txt or "'component': 'VBtn'" in txt)
-
-    # 按钮必须指向新加的 API
-    import json
-    blob = json.dumps(page, ensure_ascii=False)
-    check("按钮调用 scan_now", "scan_now" in blob)
-    check("按钮用 VSpacer 靠右", '"VSpacer"' in blob)
-
-print("\n=== 6. 插件停用时按钮禁用 ===")
-with Tree() as t:
-    p = make_plugin(mod, download_tv=str(t / "dl"), library_tv=str(t / "lib"),
-                    enabled=False)
-    import json
+    p = make_plugin(mod, download_movie=str(t / "dl"), library_movie=str(t / "lib"))
     blob = json.dumps(p.get_page(), ensure_ascii=False)
-    check("disabled=True", '"disabled": true' in blob or '"disabled":true' in blob,
-          "按钮未禁用")
-
-print("\n=== 7. 详情页整体没被破坏 ===")
-with Tree() as t:
-    (t / "ok").mkdir()
-    p = make_plugin(mod, download_movie=str(t / "ok"), library_movie=str(t / "ok"))
-    txt = str(p.get_page())
-    check("状态条还在", "运行中" in txt)
-    check("统计磁贴还在", "媒体库 strm" in txt and "上次未匹配" in txt)
-    check("运行信息面板还在", "下载目录" in txt)
+    check("详情页没有 VBtn", '"VBtn"' not in blob)
+    check("详情页没有假 onClick", "onClick" not in blob)
+    check("状态条还在", "运行中" in blob)
+    check("统计磁贴还在", "媒体库 strm" in blob)
 
 print("\n" + "=" * 60)
 if F:

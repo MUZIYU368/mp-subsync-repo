@@ -903,7 +903,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.8.0"
+    plugin_version = "1.8.1"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -925,7 +925,15 @@ class SubSync(_PluginBase):
     _alias = ""
 
     def init_plugin(self, config: dict = None) -> None:
-        """根据插件配置初始化运行状态。"""
+        """根据插件配置初始化运行状态。
+
+        run_now 是「立即运行一次」的一次性触发位：用户在配置页打开它并保存，
+        本方法被宿主再次调用时消费掉这个信号并同步执行一次全库补扫，
+        随后清回 False，避免下次任何配置变更都重复触发。
+        """
+        trigger_now = False
+        if config:
+            trigger_now = bool(config.pop("run_now", False))
         self.stop_service()
         self._enabled = False
         self._overwrite = False
@@ -962,6 +970,39 @@ class SubSync(_PluginBase):
         self._backfill_cron = str(config.get("backfill_cron") or "")
         self._alias = str(config.get("alias") or "")
 
+        if trigger_now:
+            # 消费掉信号并立即执行；不阻塞后续配置生效
+            self._consume_run_now()
+
+    def _consume_run_now(self) -> None:
+        """执行一次「立即运行」请求，并把触发位复位。
+
+        复位通过 update_config 写回 False 完成，否则这个开关会一直为真，
+        之后每次改任何配置项都会重跑一遍补扫。
+        """
+        try:
+            cfg = dict(self.get_config() or {})
+        except Exception:
+            cfg = {}
+        cfg["run_now"] = False
+        try:
+            self.update_config(cfg)
+        except Exception as exc:
+            logger.debug(f"[字幕同步] 复位 run_now 失败: {exc}")
+
+        if not self._enabled:
+            logger.info("[字幕同步] 收到立即运行请求，但插件未启用，已跳过")
+            self._notify("插件未启用，无法执行全库补扫", level="warning")
+            return
+        try:
+            msg = self.scan_library()
+        except Exception as exc:
+            logger.error(f"[字幕同步] 立即补扫异常: {exc}")
+            self._notify(f"补扫异常: {exc}", level="error")
+            return
+        data = self.get_data("last_scan") or {}
+        self._notify(msg, level="error" if data.get("error") else "success")
+
     def get_state(self) -> bool:
         """获取插件启用状态。"""
         return self._enabled
@@ -980,14 +1021,18 @@ class SubSync(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """返回插件 API 列表。"""
+        """返回插件 API 列表。
+
+        ⚠️ endpoint 是必填项：缺了它宿主不会把函数挂到路由上，
+        请求 /plugin/SubSync/scan_now 会直接 404，按钮点了没反应。
+        """
         return [
             {
                 "path": "/scan_now",
+                "endpoint": self.run_scan_now,
                 "methods": ["GET", "POST"],
                 "summary": "立即执行一次全库补扫",
                 "description": "手动触发字幕全库补扫，同步执行并返回本次结果。",
-                "response_model": None,
                 "tags": ["SubSync"],
             }
         ]
@@ -1103,6 +1148,19 @@ class SubSync(_PluginBase):
                                         "color": "primary",
                                         "hideDetails": True}}]},
             ]},
+            # ---- 立即运行一次：打开后保存即触发，跑完自动复位 ----
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6},
+                 "content": [{"component": "VSwitch",
+                              "props": {"model": "run_now",
+                                        "label": "立即运行一次",
+                                        "color": "info",
+                                        "hideDetails": True}}]},
+            ]},
+            {"component": "VAlert",
+             "props": {"variant": "text", "density": "compact",
+                       "text": "打开「立即运行一次」并保存 → 立刻全库补扫一遍并推送结果，"
+                               "跑完自动复位，下次改配置不会重复执行。"}},
         ]
 
         # ---- 路径分组 ----
@@ -1148,6 +1206,7 @@ class SubSync(_PluginBase):
             "delete_source": False,
             "use_transfer_history": True,
             "multi_version": True,
+            "run_now": False,
             "download_movie": "/media/downloads/电影,/media/待上传",
             "download_tv": "/media/downloads/电视剧,/media/待上传",
             "library_movie": "/media/电影",
@@ -1329,22 +1388,6 @@ class SubSync(_PluginBase):
             "text": f"补扫 {self._backfill_cron or '30 4 * * *'}",
         })
 
-        run_btn = {
-            "component": "VBtn",
-            "props": {
-                "variant": "tonal",
-                "color": "primary",
-                "size": "small",
-                "prependIcon": "mdi-play-circle-outline",
-                "loading": False,
-                "disabled": not enabled,
-                "onClick": "api.get('plugin/SubSync/scan_now').then(r => "
-                           "window.dispatchEvent(new CustomEvent('subsync-scan-result', "
-                           "{ detail: r.data || r })))",
-            },
-            "text": "立即补扫一次",
-        }
-
         header = {
             "component": "VCard",
             "props": {"variant": "outlined", "class": "mb-3"},
@@ -1357,10 +1400,7 @@ class SubSync(_PluginBase):
                               "color": "success" if enabled else "error",
                               "class": "font-weight-bold"},
                     "text": "运行中" if enabled else "已停用",
-                }] + chips + [{
-                    "component": "VSpacer",
-                    "props": {},
-                }, run_btn],
+                }] + chips,
             }],
         }
 
