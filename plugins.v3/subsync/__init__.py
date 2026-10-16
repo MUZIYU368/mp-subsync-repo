@@ -903,7 +903,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.7.0"
+    plugin_version = "1.8.0"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -981,7 +981,40 @@ class SubSync(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         """返回插件 API 列表。"""
-        return []
+        return [
+            {
+                "path": "/scan_now",
+                "methods": ["GET", "POST"],
+                "summary": "立即执行一次全库补扫",
+                "description": "手动触发字幕全库补扫，同步执行并返回本次结果。",
+                "response_model": None,
+                "tags": ["SubSync"],
+            }
+        ]
+
+    def run_scan_now(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """立即补扫一次。供详情页按钮与 API 调用，逻辑与定时任务完全一致。
+
+        同步执行并把结果返回，前端据此弹出提示；统计照常落盘，
+        因此按完按钮详情页的「上次补扫」面板会同步刷新。
+        """
+        if not self._enabled:
+            msg = "插件未启用，请先在设置里打开开关"
+            self._notify(msg, level="warning")
+            return {"success": False, "message": msg}
+
+        try:
+            msg = self.scan_library()
+        except Exception as exc:  # 按钮点击不能把接口打崩
+            logger.error(f"[字幕同步] 手动补扫异常: {exc}")
+            self._notify(f"补扫异常: {exc}", level="error")
+            return {"success": False, "message": f"补扫异常: {exc}"}
+
+        stat = self.get_data("last_scan") or {}
+        success = not stat.get("error")
+        level = "success" if success else "error"
+        self._notify(msg, level=level)
+        return {"success": success, "message": msg, "stat": stat}
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册定时全库补扫服务，作为事件通道的兜底。"""
@@ -1296,6 +1329,22 @@ class SubSync(_PluginBase):
             "text": f"补扫 {self._backfill_cron or '30 4 * * *'}",
         })
 
+        run_btn = {
+            "component": "VBtn",
+            "props": {
+                "variant": "tonal",
+                "color": "primary",
+                "size": "small",
+                "prependIcon": "mdi-play-circle-outline",
+                "loading": False,
+                "disabled": not enabled,
+                "onClick": "api.get('plugin/SubSync/scan_now').then(r => "
+                           "window.dispatchEvent(new CustomEvent('subsync-scan-result', "
+                           "{ detail: r.data || r })))",
+            },
+            "text": "立即补扫一次",
+        }
+
         header = {
             "component": "VCard",
             "props": {"variant": "outlined", "class": "mb-3"},
@@ -1308,7 +1357,10 @@ class SubSync(_PluginBase):
                               "color": "success" if enabled else "error",
                               "class": "font-weight-bold"},
                     "text": "运行中" if enabled else "已停用",
-                }] + chips,
+                }] + chips + [{
+                    "component": "VSpacer",
+                    "props": {},
+                }, run_btn],
             }],
         }
 
