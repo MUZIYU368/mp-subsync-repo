@@ -164,12 +164,43 @@ class XferRecord:
 
 
 def strip_lang_tag(stem: str) -> str:
-    """去掉文件名里的语言标记，返回干净的基础名。"""
-    name = stem
-    for rx, _ in LANG_TAGS:
-        m = rx.search(name)
-        if m:
-            return (name[: m.start()] + name[m.end():]).strip(".-_ ")
+    """去掉文件名里的语言标记，返回干净的基础名。
+
+    **循环剥到剥不动为止**（v1.9.1 修）：原先命中第一条匹配就 return，只剥掉
+    一个语言标签。字幕名带双标签（`.chs.zh` / `.chs&eng.zh`）时，剩下的 `.zh`
+    前面没有分隔符，会直接粘到发布组名后面——
+
+        From.S01E05...-TEPES.chs.zh  →  ...-TEPESzh  →  token 'tepeszh'
+
+    而转移历史里的视频名是完整形式，切出 5-6 个 token。字幕的 3 个 token 去比，
+    覆盖率恒定 0.4，过不了 `cov >= 0.8` 门槛：明明有完美对应的转移记录
+    （hit=5 cov=1.00）却报未匹配，字幕留在下载目录。
+
+    只在名字**末尾**剥，避免误伤标题里的字样（`The.Chinese.Garden`、
+    `English.Teacher` 里的 Chi / Eng 不是语言标签）。
+
+    `&` 连接的多语言尾巴（`.chs&eng.zh` / `.cht&zh`）当作**整段**剥：
+    匹配点落在 & 之前的那个标签上，把 `&` 后面整条语言链一起吃掉。
+    """
+    name = str(stem or "")
+    # 一条语言尾巴：`&` 可重复，每段是语言缩写（可带 -hans/-hant 变体）
+    TAIL = r"(?:&[\s.\-_]*[A-Za-z]{2,4}(?:[-_](?:Hans|Hant|Trad|Simp))?)*"
+    changed = True
+    while changed:
+        changed = False
+        for rx, _ in LANG_TAGS:
+            m = rx.search(name)
+            if not m:
+                continue
+            tail = name[m.end():]
+            # 命中位置之后必须只剩分隔符与语言片段，说明这是名字尾巴上的标签
+            if tail and not re.fullmatch(TAIL, tail):
+                continue
+            # 把 & 后面整条语言链一起吃掉（`.chs&eng.zh` → 一个标签整段剥）
+            chain = re.match(TAIL, tail)
+            name = (name[: m.start()] + tail[chain.end():]).strip(".-_ &")
+            changed = True
+            break
     return name
 
 
@@ -953,7 +984,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.9.0"
+    plugin_version = "1.9.1"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"

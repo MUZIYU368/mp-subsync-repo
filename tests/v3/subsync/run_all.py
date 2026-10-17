@@ -17,6 +17,7 @@ SUITES = [
     ("插件核心功能（端到端）", "verify_end_to_end.py"),
     ("源文件清理开关", "verify_delete_source.py"),
     ("转移历史通道", "verify_transfer_history.py"),
+    ("多语言标签剥离", "verify_lang_tag.py"),
 ]
 
 failed = []
