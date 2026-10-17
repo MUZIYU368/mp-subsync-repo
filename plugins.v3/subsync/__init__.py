@@ -522,15 +522,45 @@ def build_tv_entries(strm_files: List[Path]) -> List[TvEntry]:
     return list(groups.values())
 
 
+def _open_session() -> Tuple[Any, bool]:
+    """借 MoviePilot 自己的会话工厂开一个只读会话。
+
+    返回 (会话, 是否由本函数创建)。拿不到工厂就返回 (None, False)，
+    由调用方退回「不传 db」的调用形态。
+    """
+    for mod_path in ("app.db.session", "app.db"):
+        try:
+            module = importlib.import_module(mod_path)
+        except Exception:
+            continue
+        for name in ("ScopedSession", "SessionFactory"):
+            factory = getattr(module, name, None)
+            if callable(factory):
+                try:
+                    return factory(), True
+                except Exception:
+                    continue
+    return None, False
+
+
 def fetch_transfer_rows(limit: int = 20000) -> Optional[List[Any]]:
     """读取 MoviePilot 转移历史表。
 
     模型类与静态方法的形态在不同 MP 版本间有差异，这里把常见的几个导入位置
     逐个尝试并全量兜底；只要拿不到就返回 None，调用方自动退回启发式匹配，
     不会影响同步本身。
+
+    **会话是必须的**（v1.9.0 修的就是这一条）：MP v3 把 `list_by_page` 从
+    「静态方法 + `db_query` 装饰器自动注入会话」改成了「classmethod + 第一个
+    位置参数必填 `db: Session`」。插件原先只用关键字参数调用、不传 db，
+    每次都抛 TypeError，四种调用形态全试完都失败，于是返回 None，日志打
+    「取不到转移历史表」——可用户 MP 里明明躺着上万条转移历史。这是个
+    **静默降级**：字幕同步照常跑，只是全部退到启发式，英文字幕配中文库
+    名时必然匹配失败，用户看到的是「明明有记录却找不到」。
     """
     model = None
     for mod_path, attr in (("app.db.models.transferhistory", "TransferHistory"),
+                           ("app.db.models", "TransferHistory"),
                            ("app.db.oper.transferhistory", "TransferHistoryOper"),
                            ("app.db.models.oper.transferhistory", "TransferHistoryOper")):
         try:
@@ -547,20 +577,40 @@ def fetch_transfer_rows(limit: int = 20000) -> Optional[List[Any]]:
              or getattr(model, "list_by_date", None))
     if not callable(query):
         return None
+
+    session, owned = _open_session()
     called = False
-    for kwargs in ({"page": 1, "count": limit, "status": True},
-                   {"page": 1, "count": limit},
-                   {"date": "1970-01-01 00:00:00"},
-                   {}):
-        try:
-            rows = query(**kwargs)
-            called = True
-        except TypeError:
-            continue
-        except Exception:
-            return None
-        if rows:
-            return list(rows)[:limit]
+    try:
+        for kwargs in ({"page": 1, "count": limit, "status": True},
+                       {"page": 1, "count": limit},
+                       {"date": "1970-01-01 00:00:00"},
+                       {}):
+            try:
+                # v3 的 db 是必填位置参数，不传就 TypeError；v2 的装饰器不需要它
+                rows = query(db=session, **kwargs) if session is not None \
+                    else query(**kwargs)
+                called = True
+            except TypeError:
+                if session is not None:
+                    try:
+                        rows = query(**kwargs)
+                        called = True
+                    except TypeError:
+                        continue
+                    except Exception:
+                        return None
+                else:
+                    continue
+            except Exception:
+                return None
+            if rows:
+                return list(rows)[:limit]
+    finally:
+        if owned and session is not None:
+            try:
+                session.close()
+            except Exception as exc:
+                logger.warning(f"[字幕同步] 关闭数据库会话失败（可忽略）: {exc}")
     # 一次都没调用成功 = 压根不知道 MP 这边长什么样，按「取不到」处理
     return [] if called else None
 
@@ -903,7 +953,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.8.1"
+    plugin_version = "1.9.0"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
