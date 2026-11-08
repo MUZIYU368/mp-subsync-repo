@@ -18,6 +18,7 @@ SUITES = [
     ("源文件清理开关", "verify_delete_source.py"),
     ("转移历史通道", "verify_transfer_history.py"),
     ("多语言标签剥离", "verify_lang_tag.py"),
+    ("MP v3 事件负载形态适配", "verify_pydantic_event.py"),
 ]
 
 failed = []
