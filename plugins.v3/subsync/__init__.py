@@ -553,6 +553,31 @@ def build_tv_entries(strm_files: List[Path]) -> List[TvEntry]:
     return list(groups.values())
 
 
+def field_of(obj: Any, name: str, default: Any = None) -> Any:
+    """从「字典或对象」上取字段，兼容两种形态。
+
+    **MP v3 把事件负载里的 `transferinfo` 从 dict 换成了 Pydantic 模型**
+    （`app.schemas.transfer.TransferInfo`），插件原先一律用 `.get()` 取值，
+    遇到模型直接抛 `AttributeError: 'TransferInfo' object has no attribute 'get'`。
+    这个异常发生在 `TransferComplete` 事件处理器里，于是每一次整理完成都会
+    走一遍「抛异常 → 进 outbox → 30 秒后重试 → 5 次后进死信」的流程。
+
+    代价不是一条报错那么小：死信表 `outboxmessage` 一天涨几千行、涨到
+    几十万行后，光是取「最近 N 条」就要全表扫描几百毫秒到几秒，MP 的
+    写锁竞争随之而来，用户感知就是「MP 反应慢」。根因在插件侧、显现在
+    MP 整体，所以这里做双形态兼容而不是让用户去清库。
+
+    同时兼容 dict（含 `model_dump()` 后的字典）与任意带同名属性的对象。
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        value = obj.get(name, default)
+    else:
+        value = getattr(obj, name, default)
+    return default if value is None else value
+
+
 def _open_session() -> Tuple[Any, bool]:
     """借 MoviePilot 自己的会话工厂开一个只读会话。
 
@@ -984,7 +1009,7 @@ class SubSync(_PluginBase):
     plugin_name = "外挂字幕同步"
     plugin_desc = "整理完成后把下载目录里的外挂字幕按 strm 同名复制到最终媒体库目录。"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.9.1"
+    plugin_version = "1.9.2"
     plugin_author = "MUZIYU368"
     plugin_label = "字幕"
     plugin_config_prefix = "subsync_"
@@ -1656,18 +1681,38 @@ class SubSync(_PluginBase):
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
-        """通道一：整理完成时，只处理本次整理涉及的目标目录。"""
+        """通道一：整理完成时，只处理本次整理涉及的目标目录。
+
+        **整个函数体裹在 try/except 里**：事件处理器一旦抛异常，MoviePilot 会把
+        这条事件丢进 outbox 重试（30 秒一次、5 次后进死信表）。死信表是 MP 的
+        核心表之一，涨到几十万行后，取「最近 N 条」就要全表扫描几百毫秒，
+        连带拖慢 MP 整体响应。v1.9.2 修的 `TransferInfo` 取值崩溃就是这么
+        变成「MP 越来越慢」的。
+
+        所以这里的原则是：**插件的任何问题都只影响字幕同步本身，不许外溢到
+        MP 的事件总线**。捕获后记日志、下一条转移事件继续处理。
+        """
         if not self._enabled:
             return
+        try:
+            self._on_transfer_complete(event)
+        except Exception as exc:
+            logger.warning(f"[字幕同步] 处理整理完成事件失败（不影响其他插件）: {exc}")
+
+    def _on_transfer_complete(self, event: Event) -> None:
+        """整理完成事件的实际处理逻辑（由 on_transfer_complete 统一兜底异常）。"""
         data = event.event_data or {}
         transfer = data.get("transferinfo")
         if not transfer:
             return
 
-        target = transfer.get("target_diritem")
-        if not target or not target.get("path"):
+        # MP v3 的 transferinfo 是 Pydantic 模型而非 dict，
+        # 一律用 field_of 取值（dict / 对象都兼容）。
+        target = field_of(transfer, "target_diritem")
+        target_path = field_of(target, "path")
+        if not target_path:
             return
-        target_root = Path(target["path"])
+        target_root = Path(target_path)
         try:
             if not target_root.exists():
                 return
